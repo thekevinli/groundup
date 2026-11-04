@@ -432,6 +432,17 @@ details.files[open]>summary{border-bottom:1px solid var(--line)}
   .files-grid{grid-template-columns:minmax(0,1fr)}
   .files-grid .ft{border-right:0;border-bottom:1px solid var(--line)}
 }
+
+/* ---------- accounting tables (Model steps) ---------- */
+.g-card.acct h3{color:var(--inner)}
+.acct-note{margin:0;font-size:13.5px;color:var(--muted)}
+.acct-wrap{overflow-x:auto}
+.acct table{border-collapse:collapse;width:100%;font-size:14px}
+.acct th,.acct td{text-align:left;vertical-align:baseline;padding:6px 14px 6px 0;border-top:1px solid var(--line)}
+.acct tr:first-child th,.acct tr:first-child td{border-top:0}
+.acct th{font-weight:600;white-space:nowrap}
+.acct td.ex{font:12.5px var(--f-code);color:var(--muted);white-space:nowrap;padding-right:0}
+@media (max-width:720px){.acct th,.acct td.ex{white-space:normal}}
 </style>
 
 <div class="shell" id="shell">
@@ -1318,6 +1329,7 @@ function makeGuide(host, pane){
       ${s.math ? `<section class="g-card math"><h3>Chain rule, backward</h3>${s.math.map(m=>`<div class="eq">\\[${m}\\]</div>`).join('')}</section>` : ''}
       <div class="g-grid"><section class="g-card"><h3>${s.sayTitle || 'Say this while you code'}</h3>${li(s.say)}</section>
         <section class="g-card watch"><h3>${s.watchTitle || 'Watch out'}</h3>${li(s.watch)}</section></div>
+      ${s.acct ? `<section class="g-card acct"><h3>Accounting</h3><p class="acct-note">${s.acct.note}</p><div class="acct-wrap"><table>${s.acct.rows.map(([q,f,e])=>`<tr><th scope="row">${q}</th><td>${f}</td><td class="ex">${e}</td></tr>`).join('')}</table></div></section>` : ''}
       ${s.extra ? `<section class="g-card"><h3>${s.extra[0]}</h3>${li(s.extra[1])}</section>` : ''}
       ${(s.cards || []).map(([t, items]) => `<section class="g-card"><h3>${t}</h3>${li(items)}</section>`).join('')}
       ${s.fig ? `<figure class="g-fig"><div class="figbody"></div>${s.figCap ? `<figcaption>${s.figCap}</figcaption>` : ''}</figure>` : ''}
@@ -1602,6 +1614,7 @@ const GUIDE = [
 },
 {
   group:'Model', short:'Review', file:'gpt.py', src:'gpt_1', base:'gpt_0', baseLabel:'vs your template', title:'MHSA and a pre-norm block, reviewed',
+  acct:{"note": "One block, one sequence. GPT-2 small: \\(D=768,\\ H=12,\\ S=1024\\).", "rows": [["Parameters", "\\(4D^2\\) attention \\(+\\ 8D^2\\) MLP \\(=12D^2\\)", "7.1M"], ["Forward FLOPs", "\\(24SD^2\\) matmuls \\(+\\ 4S^2D\\) for \\(QK^\\top\\) and \\(AV\\)", "14.5G + 3.2G"], ["Attention ≥ matmuls", "\\(S > 6D\\)", "S > 4,608"], ["Training FLOPs", "\\(3\\times\\) forward (backward \\(=2\\times\\))", "53G"], ["Saved activations", "\\(34SD\\) bytes \\(+\\ 5HS^2\\) without FlashAttention", "27 MB + 63 MB"]]},
   ask:'Walk me through your attention. Why each line?',
   say:[
     '<b>Shapes out loud.</b> x (B, S, F) → qkv (B, S, 3F) → q, k, v (B, H, S, hd) with hd = F/H → scores (B, H, S, S) → output (B, S, F). Heads are a reshape: no extra parameters.',
@@ -1626,6 +1639,7 @@ const GUIDE = [
 },
 {
   group:'Model', short:'GQA', file:'gpt.py', src:'gpt_2', base:'gpt_1', title:'Grouped-query attention',
+  acct:{"note": "\\(H_{kv}\\) KV heads, head dim \\(d_h=D/H\\), bf16. Example: Llama 3 8B (\\(L=32,\\ H=32,\\ H_{kv}=8,\\ d_h=128\\)).", "rows": [["Attention params", "\\(2D^2 + 2D^2\\,H_{kv}/H\\)", "\\(4D^2 \\to 2.5D^2\\)"], ["KV cache / sequence", "\\(2\\cdot L\\cdot S\\cdot H_{kv}d_h\\cdot 2\\) bytes", "8k: 1.1 GB (MHA 4.3 GB)"], ["FLOPs", "scores unchanged; only \\(W_K, W_V\\) shrink", "≈ same"], ["Decode step", "reads all weights + the KV cache for \\(\\approx 2N\\) FLOPs", "memory-bound: the win is bandwidth"]]},
   ask:'Add grouped-query attention. What does it save, and what doesn’t it?',
   say:[
     'H<sub>kv</sub> key/value heads, each shared by H/H<sub>kv</sub> query heads. H<sub>kv</sub> = H is MHA; H<sub>kv</sub> = 1 is MQA.',
@@ -1682,6 +1696,7 @@ const GUIDE = [
 },
 {
   group:'Model', short:'Long context', file:'gpt.py', src:'gpt_5', base:'gpt_4', title:'Long context: PI, NTK-aware and YaRN',
+  acct:{"note": "Example: Llama 3 8B (\\(D=4096,\\ L=32,\\ H=32,\\ H_{kv}=8\\)) at 128k.", "rows": [["Attention / matmul FLOPs", "\\(4S^2D \\,/\\, 24SD^2 = S/6D\\)", "5.3×"], ["KV cache / sequence", "linear in \\(S\\)", "17 GB"], ["Scores, no FlashAttention", "\\(H S^2\\) per layer", "1.1 TB → FA is required"], ["PI, NTK, YaRN", "only the RoPE frequencies change", "0 params, 0 FLOPs"]]},
   ask:'Your model was trained at 2k tokens. You need 8k. Which RoPE frequencies do you slow down, and how?',
   sayTitle:'The answer',
   say:[
@@ -1704,6 +1719,7 @@ const GUIDE = [
 },
 {
   group:'Model', short:'nanoGPT', file:'gpt.py', src:'gpt_6', base:'gpt_5', title:'nanoGPT with greedy generate()',
+  acct:{"note": "Tied head, \\(T\\) training tokens. GPT-2 124M: \\(L=12,\\ D=768,\\ V=50257,\\ S=1024\\).", "rows": [["Parameters", "\\(N \\approx 12LD^2 + VD\\)", "85M + 39M (+0.8M positions)"], ["Training FLOPs / token", "\\(6N + 12LSD\\)", "0.75G + 0.11G"], ["Training compute", "\\(C \\approx (6N + 12LSD)\\,T\\)", "9.89B tokens: 8.5e18"], ["Model states", "16 B/param: bf16 \\(w, g\\); fp32 master, \\(m, v\\)", "2.0 GB"], ["Inference FLOPs / token", "\\(2N + 4LSD\\)", "0.29G"], ["This generate()", "no KV cache: \\(T\\) tokens cost \\(\\sim N T^2\\); with one, \\(2N\\) each", "quadratic → linear"]]},
   ask:'Wrap the blocks into a decoder-only language model with a loss and greedy generation.',
   say:[
     'tok_emb → (+ sinusoidal PE) → N blocks (RoPE inside attention) → final LayerNorm → lm_head. The final LN is needed because pre-norm leaves the residual stream unnormalized.',
@@ -1789,6 +1805,7 @@ const GUIDE = [
 },
 {
   group:'Model', short:'MoE', file:'gpt.py', src:'gpt_9', base:'gpt_8', title:'Mixture of experts (token choice)',
+  acct:{"note": "\\(E\\) experts, top-\\(k\\), expert MLP \\(8D^2\\). Example: Mixtral 8×7B (\\(E=8,\\ k=2\\)).", "rows": [["Total params", "\\(L(4D^2 + 8ED^2 + DE)\\) + embeddings", "47B"], ["Active / token", "\\(L(4D^2 + 8kD^2)\\) + embeddings", "13B"], ["FLOPs / token", "\\(2\\times\\) active (+ router \\(2DE\\))", "≈ 26G forward"], ["Memory", "every expert resident: 16 B × total", "750 GB of states"], ["Expert capacity", "\\(c\\,kT/E\\) tokens; overflow is dropped", "c=1.25, T=4096: 1,280"], ["EP traffic", "2 all-to-alls per layer, \\(kTD\\) elements each", "dispatch + combine"]]},
   ask:'Replace the MLP with a token-choice mixture of experts.',
   say:[
     'Router: a linear F → E and a softmax. Each token picks its top-k experts and the output is the gate-weighted sum of their MLPs, with gates renormalized over the k chosen.',
