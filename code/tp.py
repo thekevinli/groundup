@@ -1,0 +1,150 @@
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.nn import functional as F
+
+from collectives import all_gather, all_reduce, ranks, reduce_scatter
+
+
+class CopyToTP(torch.autograd.Function):
+    # Megatron "f": identity forward; all-reduce backward (every rank consumed the same input)
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return all_reduce(grad, ctx.group), None
+
+
+class ReduceFromTP(torch.autograd.Function):
+    # Megatron "g": all-reduce forward (sum the partial outputs); identity backward
+    @staticmethod
+    def forward(ctx, x, group):
+        return all_reduce(x, group)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
+class AllGatherSeq(torch.autograd.Function):
+    # SP "g": all-gather the sequence dim forward; reduce-scatter backward
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return all_gather(x, dim=1, group=group)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return reduce_scatter(grad, dim=1, group=ctx.group), None
+
+
+class ReduceScatterSeq(torch.autograd.Function):
+    # SP "g-bar": sum the partial outputs but keep only my slice of the sequence; all-gather backward
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return reduce_scatter(x, dim=1, group=group)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return all_gather(grad, dim=1, group=ctx.group), None
+
+
+class ScatterToSeq(torch.autograd.Function):
+    # enter SP: keep my slice of the sequence; backward all-gathers (what follows ran on every rank)
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        rank, world, _ = ranks(group)
+        return x.chunk(world, dim=1)[rank].contiguous()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return all_gather(grad, dim=1, group=ctx.group), None
+
+
+class GatherFromSeq(torch.autograd.Function):
+    # leave SP: all-gather the sequence; backward keeps my slice (every rank computed the same thing)
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return all_gather(x, dim=1, group=group)
+
+    @staticmethod
+    def backward(ctx, grad):
+        rank, world, _ = ranks(ctx.group)
+        return grad.chunk(world, dim=1)[rank].contiguous(), None
+
+
+class ColumnParallelLinear(nn.Linear):
+    # my 1/tp of the OUTPUT features. Input: the same full x on every rank (TP), or
+    # my slice of the sequence (SP), all-gathered here.
+    def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
+        self.group, self.tp, self.sp = group, ranks(group)[1] if group else 1, sequence_parallel
+        super().__init__(in_features, out_features // self.tp)
+
+    def forward(self, x):
+        if self.tp > 1:
+            x = (AllGatherSeq if self.sp else CopyToTP).apply(x, self.group)
+        return super().forward(x)
+
+
+class RowParallelLinear(nn.Linear):
+    # my 1/tp of the INPUT features, so every rank's output is a partial sum: all-reduce it (TP),
+    # or reduce-scatter it to my slice of the sequence (SP). Same bytes, 1/tp of the activations.
+    def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
+        self.group, self.tp, self.sp = group, ranks(group)[1] if group else 1, sequence_parallel
+        super().__init__(in_features // self.tp, out_features)
+        self.bias.sequence_parallel = sequence_parallel        # added in the SP region: see sync_sp_grads
+
+    def forward(self, x):
+        if self.tp == 1:
+            return super().forward(x)
+        y = F.linear(x, self.weight)
+        y = (ReduceScatterSeq if self.sp else ReduceFromTP).apply(y, self.group)
+        return y + self.bias                                   # added once, after the sum
+
+
+def sync_sp_grads(model: nn.Module, group):
+    # parameters used in the SP region (norms, row-parallel biases) saw only my slice of the
+    # sequence: sum their gradients over the TP group. Megatron marks them the same way.
+    for p in model.parameters():
+        if getattr(p, "sequence_parallel", False) and p.grad is not None:
+            p.grad = all_reduce(p.grad, group)
+
+
+def _test(rank: int, tp: int):
+    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29502", rank=rank, world_size=tp)
+    torch.manual_seed(0)                                       # same full MLP and input everywhere
+    full = nn.Sequential(nn.Linear(16, 64), nn.GELU(), nn.Linear(64, 16))
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    (full(x) ** 2).sum().backward()
+
+    group = dist.group.WORLD                                   # all ranks form the TP group here
+    h = slice(rank * 64 // tp, (rank + 1) * 64 // tp)          # my hidden units
+    for sp in (False, True):
+        mlp = nn.Sequential(ColumnParallelLinear(16, 64, group, sp), nn.GELU(), RowParallelLinear(64, 16, group, sp))
+        with torch.no_grad():
+            mlp[0].weight.copy_(full[0].weight[h]); mlp[0].bias.copy_(full[0].bias[h])
+            mlp[2].weight.copy_(full[2].weight[:, h]); mlp[2].bias.copy_(full[2].bias)
+        mine = (lambda t: t.chunk(tp, dim=1)[rank]) if sp else (lambda t: t)   # SP: my slice of S
+        xs = mine(x.detach()).clone().requires_grad_()
+        out = mlp(xs)
+        (out ** 2).sum().backward()
+        if sp:
+            sync_sp_grads(mlp, group)                          # without it the bias grad is 1/tp short
+        assert torch.allclose(out, mine(full(x)), atol=1e-5)
+        assert torch.allclose(xs.grad, mine(x.grad), atol=1e-5)
+        assert torch.allclose(mlp[0].weight.grad, full[0].weight.grad[h], atol=1e-5)
+        assert torch.allclose(mlp[2].weight.grad, full[2].weight.grad[:, h], atol=1e-5)
+        assert torch.allclose(mlp[2].bias.grad, full[2].bias.grad, atol=1e-5)
+        if rank == 0:
+            print(("SP" if sp else "TP"), "MLP (column -> GELU -> row) matches the single-GPU MLP")
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    torch.multiprocessing.spawn(_test, args=(2,), nprocs=2)
