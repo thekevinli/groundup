@@ -54,7 +54,9 @@ def rope_freqs(head_dim: int, base: float = 10000.0, scale: float = 1.0,
 
 
 def rope_cos_sin(pos: torch.Tensor, freqs: torch.Tensor, mscale: float = 1.0):
-    angles = pos[..., None].float() * freqs                           # (S, hd/2)
+    angles = pos[..., None].float() * freqs                           # (S, hd/2), or (B, S, hd/2) packed
+    if angles.dim() == 3:
+        angles = angles[:, None]                                      # (B, 1, S, hd/2): shared by heads
     return torch.cos(angles) * mscale, torch.sin(angles) * mscale    # YaRN: mscale sharpens attention
 
 
@@ -81,24 +83,30 @@ class MHSA(nn.Module):
         self.qkv = ColumnParallelLinear(feat_dim, feat_dim + 2 * num_kv_head * self.head_dim, tp_group, True)
         self.out = RowParallelLinear(feat_dim, feat_dim, tp_group, True)
 
-    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None,
+                cache=None) -> torch.Tensor:
         # x: (B, S, F), my slice of S under SP; rope: (cos, sin) or None; attn_mask: bool, True = may attend
-        S = x.shape[1] * self.qkv.tp                                      # qkv all-gathers the sequence
+        # cache: this layer's {"k", "v"} while decoding, or None
         q, k, v = self.qkv(x).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         q = rearrange(q, "b s (h f) -> b h s f", h=self.num_head)
         k = rearrange(k, "b s (h f) -> b h s f", h=self.num_kv_head)
         v = rearrange(v, "b s (h f) -> b h s f", h=self.num_kv_head)
         if rope is not None:                                              # rotate q and k, never v
             q, k = apply_rope(q, *rope), apply_rope(k, *rope)
+        if cache is not None:                                             # decoding: past k, v + the new ones
+            if "k" in cache:
+                k, v = torch.cat([cache["k"], k], dim=2), torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v                                 # H_kv heads: GQA's saving lands here
         if self.cp_group:                                                 # CP: every rank's keys and values
             k, v = (t.transpose(1, 2) for t in all_gather_kv(k.transpose(1, 2), v.transpose(1, 2), self.cp_group))
         # each K/V head serves H / H_kv query heads: same attention FLOPs, H / H_kv smaller KV cache
         k = k.repeat_interleave(self.num_head // self.num_kv_head, dim=1)
         v = v.repeat_interleave(self.num_head // self.num_kv_head, dim=1)
         # q.k sums head_dim terms, so its std grows like sqrt(head_dim): rescale to keep softmax soft
-        score = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)       # (B, H, S, S)
-        if attn_mask is None and is_causal:
-            attn_mask = torch.ones(S, S, dtype=torch.bool, device=x.device).tril()
+        score = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)       # (B, H, S_q, S_k)
+        if attn_mask is None and is_causal:                               # the queries are the last S_q keys
+            Sq, Sk = q.shape[2], k.shape[2]
+            attn_mask = torch.ones(Sq, Sk, dtype=torch.bool, device=x.device).tril(diagonal=Sk - Sq)
         if attn_mask is not None:
             score = score.masked_fill(~attn_mask, float("-inf"))          # before softmax
         attn = torch.softmax(score.float(), dim=-1).to(v.dtype) @ v       # softmax in fp32; (B, H, S, hd)
@@ -134,10 +142,11 @@ class MoE(nn.Module):
 
 class TransformerBlock(nn.Module):
 
-    def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, num_expert: int = 0,
-                 dropout: float = 0.0, tp_group=None, cp_group=None):
+    def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, use_rope: bool = True,
+                 num_expert: int = 0, dropout: float = 0.0, tp_group=None, cp_group=None):
         super().__init__()
         assert not (num_expert and tp_group), "MoE layers use expert parallelism, not TP"
+        self.use_rope = use_rope                     # False = a NoPE layer: no position signal here
         self.drop = nn.Dropout(dropout)                                   # on each branch's output
         self.ln1 = LayerNorm(feat_dim)
         self.attention = MHSA(feat_dim, num_head, num_kv_head, tp_group, cp_group)
@@ -150,9 +159,12 @@ class TransformerBlock(nn.Module):
         for p in [*self.ln1.parameters(), *self.ln2.parameters()]:      # SP: norms see my slice of S
             p.sequence_parallel = tp_group is not None
 
-    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None,
+                cache=None) -> torch.Tensor:
         # pre-norm: the residual stream x is never normalized, so gradients have an identity path
-        x = x + self.drop(self.attention(self.ln1(x), is_causal, rope, attn_mask))
+        if not self.use_rope:
+            rope = None                                                   # NoPE layer
+        x = x + self.drop(self.attention(self.ln1(x), is_causal, rope, attn_mask, cache))
         x = x + self.drop(self.mlp(self.ln2(x)))
         return x
 
@@ -168,11 +180,11 @@ class GPT(nn.Module):
         self.tp_group = tp_group                     # TP + SP inside this group; None = one GPU
         self.cp_group = cp_group                     # CP: each rank holds one chunk of the sequence
         self.pos_emb = pos_emb                       # "none" = NoPE everywhere (Kimi Linear's MLA layers)
-        self.nope_every = nope_every                 # 4 = every 4th layer drops RoPE (Llama 4, SmolLM3)
         self.max_len = int(block_size * rope_scale)                    # context allowed at inference
         self.tok_emb = nn.Embedding(vocab_size, feat_dim)
-        self.blocks = nn.ModuleList([TransformerBlock(feat_dim, num_head, num_kv_head, num_expert, dropout,
-                                                      tp_group, cp_group) for _ in range(n_layer)])
+        nope = lambda i: nope_every and (i + 1) % nope_every == 0      # 4: every 4th layer (Llama 4, SmolLM3)
+        self.blocks = nn.ModuleList([TransformerBlock(feat_dim, num_head, num_kv_head, not nope(i), num_expert,
+                                                      dropout, tp_group, cp_group) for i in range(n_layer)])
         self.ln_f = LayerNorm(feat_dim)
         self.lm_head = nn.Linear(feat_dim, vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight                       # weight tying
@@ -191,32 +203,29 @@ class GPT(nn.Module):
         if isinstance(m, nn.Linear) and m.bias is not None:
             nn.init.zeros_(m.bias)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, doc_ids=None, pos_ids=None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, doc_ids=None, pos_ids=None, cache=None):
         S = idx.shape[1]                                               # my CP chunk (all of it without CP)
         c, cp = ranks(self.cp_group)[:2] if self.cp_group else (0, 1)
+        past = cache[0]["k"].shape[2] if cache and cache[0] else 0     # tokens already in the cache
         x = self.tok_emb(idx)                                          # (B, S, F)
-        q_pos = c * S + torch.arange(S, device=idx.device)             # global positions of my tokens
-        mask = torch.arange(S * cp, device=idx.device)[None, :] <= q_pos[:, None]   # causal by position
-        if doc_ids is not None:
-            assert cp == 1, "document masks with CP: compare the gathered keys' doc ids too"                                        # packed: causal AND same document
-            mask = mask & (doc_ids[:, :, None] == doc_ids[:, None, :])
-            mask = mask[:, None]                                       # (B, 1, S, S), shared by heads
+        q_pos = past + c * S + torch.arange(S, device=idx.device)      # global positions of my tokens
         pos = pos_ids if pos_ids is not None else q_pos
+        mask = doc_mask(doc_ids) if doc_ids is not None else None      # packed rows; else plain causal
+        if cp > 1:                                                     # CP: my queries vs every rank's keys
+            assert doc_ids is None and cache is None, "with CP, compare the gathered keys' doc ids too"
+            mask = torch.arange(S * cp, device=idx.device)[None, :] <= q_pos[:, None]   # causal by position
         rope = None
         if self.pos_emb == "sin":
             x = x + self.pe[pos].to(x.dtype)
         if self.pos_emb == "rope":
-            cos, sin = rope_cos_sin(pos, self.freqs, self.mscale)
-            rope = (cos[:, None], sin[:, None]) if pos.dim() == 2 else (cos, sin)  # (B, 1, S, hd/2)
+            rope = rope_cos_sin(pos, self.freqs, self.mscale)
         if self.tp_group:
             x = ScatterToSeq.apply(x, self.tp_group)                   # SP: my slice of the sequence
         for i, block in enumerate(self.blocks):
-            nope = self.nope_every and (i + 1) % self.nope_every == 0  # no position signal at all here
-            r = None if nope else rope
             if self.grad_ckpt and self.training:     # keep only the block input; rerun the block in backward
-                x = checkpoint(block, x, rope=r, attn_mask=mask, use_reentrant=False)
+                x = checkpoint(block, x, True, rope, mask, use_reentrant=False)
             else:
-                x = block(x, rope=r, attn_mask=mask)
+                x = block(x, is_causal=True, rope=rope, attn_mask=mask, cache=cache[i] if cache else None)
         if self.tp_group:
             x = GatherFromSeq.apply(x, self.tp_group)                  # full sequence for the head
         logits = self.lm_head(self.ln_f(x))                            # (B, S, vocab)
@@ -230,11 +239,21 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+        cache, new = None, idx
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.max_len:])                   # crop to supported context
-            next_id = logits[:, -1].argmax(dim=-1, keepdim=True)       # greedy
-            idx = torch.cat([idx, next_id], dim=1)
+            if cache is None or idx.shape[1] > self.max_len:           # start, or past the context: prefill
+                cache, new = [{} for _ in self.blocks], idx[:, -self.max_len:]   # one {"k", "v"} per layer
+            logits, _ = self(new, cache=cache)                         # else decode: only the newest token
+            new = logits[:, -1].argmax(dim=-1, keepdim=True)           # greedy
+            idx = torch.cat([idx, new], dim=1)
         return idx
+
+
+def doc_mask(doc_ids: torch.Tensor) -> torch.Tensor:
+    # packed rows: causal AND same document, (B, 1, S, S), shared by heads
+    S = doc_ids.shape[1]
+    causal = torch.ones(S, S, dtype=torch.bool, device=doc_ids.device).tril()
+    return (causal & (doc_ids[:, :, None] == doc_ids[:, None, :]))[:, None]
 
 
 def pack(docs: list[list[int]], seq_len: int, pad_id: int = 0):
