@@ -1,6 +1,6 @@
 # GPT interview guide
 
-Open `gpt-interview-guide.html` in a browser (works offline). Its 39 interview-style steps build the files in `code/`, one change at a time.
+Open `gpt-interview-guide.html` in a browser (works offline). Its 40 interview-style steps build the files in `code/`, one change at a time.
 
 ![Where files live and who imports whom](files-and-imports.png)
 

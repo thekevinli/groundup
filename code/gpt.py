@@ -67,9 +67,39 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return out.to(x.dtype)                                            # cos/sin are fp32
 
 
+def linear_attention(q, k, v, state=None):
+    # softmax(q k^T) v without the softmax is associative: q (k^T v). Causal, it becomes a recurrence on a
+    # (hd, hd) state: S_t = S_{t-1} + phi(k_t)^T v_t,  o_t = phi(q_t) S_t / phi(q_t) z_t  (z: the normalizer)
+    q, k = F.elu(q) + 1, F.elu(k) + 1                                 # phi > 0: o_t is a weighted average of v
+    B, H, T, d = q.shape
+    S, z = state if state is not None else (q.new_zeros(B, H, d, v.shape[-1]), q.new_zeros(B, H, d))
+    out = []
+    for t in range(T):                                                # constant memory per token, like an RNN
+        S = S + k[:, :, t, :, None] * v[:, :, t, None, :]             # + k_t^T v_t (outer product)
+        z = z + k[:, :, t]
+        out.append((q[:, :, t, None] @ S).squeeze(2) / (q[:, :, t] * z).sum(-1, keepdim=True))
+    return torch.stack(out, dim=2), (S, z)
+
+
+def delta_rule(q, k, v, beta, state=None):
+    # DeltaNet: write the error, not the value. Read what S stores for k_t and move it toward v_t:
+    # S_t = S_{t-1} + beta_t k_t^T (v_t - k_t S_{t-1}). With |k_t| = 1 and beta_t = 1 it overwrites.
+    q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+    B, H, T, d = q.shape
+    S = state if state is not None else q.new_zeros(B, H, d, v.shape[-1])
+    out = []
+    for t in range(T):
+        kt = k[:, :, t, None]                                         # (B, H, 1, hd)
+        err = v[:, :, t, None] - kt @ S                               # new value minus the stored one
+        S = S + kt.transpose(-2, -1) @ (beta[:, :, t, None, None] * err)
+        out.append((q[:, :, t, None] @ S).squeeze(2))
+    return torch.stack(out, dim=2), S
+
+
 class MHSA(nn.Module):
 
-    def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, tp_group=None, cp_group=None):
+    def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, tp_group=None, cp_group=None,
+                 kind: str = "softmax"):
         super().__init__()
         assert feat_dim % num_head == 0
         self.cp_group = cp_group
@@ -78,9 +108,12 @@ class MHSA(nn.Module):
         assert num_head % num_kv_head == 0 and num_kv_head % tp == 0
         self.num_head, self.num_kv_head = num_head // tp, num_kv_head // tp   # TP: my heads only
         self.head_dim = feat_dim // num_head
+        self.kind = kind                                                  # "softmax", "linear" or "delta"
+        assert kind == "softmax" or (tp == 1 and not cp_group), "linear attention here is single-GPU"
         self.q_dim, self.kv_dim = self.num_head * self.head_dim, self.num_kv_head * self.head_dim
         # q: F, k and v: H_kv * hd each. TP: columns = my heads' q, k, v; rows of out = my heads
         self.qkv = ColumnParallelLinear(feat_dim, feat_dim + 2 * num_kv_head * self.head_dim, tp_group, True)
+        self.beta = nn.Linear(feat_dim, self.num_head) if kind == "delta" else None   # per-head write strength
         self.out = RowParallelLinear(feat_dim, feat_dim, tp_group, True)
 
     def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None,
@@ -91,6 +124,18 @@ class MHSA(nn.Module):
         q = rearrange(q, "b s (h f) -> b h s f", h=self.num_head)
         k = rearrange(k, "b s (h f) -> b h s f", h=self.num_kv_head)
         v = rearrange(v, "b s (h f) -> b h s f", h=self.num_kv_head)
+        if self.kind != "softmax":                                        # no S x S scores: a recurrence
+            assert attn_mask is None, "packed rows: reset the state at each document start instead"
+            rep = self.num_head // self.num_kv_head
+            k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+            state = cache.get("state") if cache is not None else None
+            if self.kind == "linear":
+                o, state = linear_attention(q, k, v, state)
+            else:
+                o, state = delta_rule(q, k, v, torch.sigmoid(self.beta(x)).transpose(1, 2), state)
+            if cache is not None:
+                cache["state"] = state                                    # its whole cache: a fixed size
+            return self.out(rearrange(o, "b h s f -> b s (h f)"))
         if rope is not None:                                              # rotate q and k, never v
             q, k = apply_rope(q, *rope), apply_rope(k, *rope)
         if cache is not None:                                             # decoding: past k, v + the new ones
@@ -143,13 +188,13 @@ class MoE(nn.Module):
 class TransformerBlock(nn.Module):
 
     def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, use_rope: bool = True,
-                 num_expert: int = 0, dropout: float = 0.0, tp_group=None, cp_group=None):
+                 num_expert: int = 0, dropout: float = 0.0, tp_group=None, cp_group=None, attn: str = "softmax"):
         super().__init__()
         assert not (num_expert and tp_group), "MoE layers use expert parallelism, not TP"
         self.use_rope = use_rope                     # False = a NoPE layer: no position signal here
         self.drop = nn.Dropout(dropout)                                   # on each branch's output
         self.ln1 = LayerNorm(feat_dim)
-        self.attention = MHSA(feat_dim, num_head, num_kv_head, tp_group, cp_group)
+        self.attention = MHSA(feat_dim, num_head, num_kv_head, tp_group, cp_group, kind=attn)
         self.ln2 = LayerNorm(feat_dim)
         self.mlp = MoE(feat_dim, num_expert) if num_expert else nn.Sequential(
             ColumnParallelLinear(feat_dim, feat_dim * 4, tp_group, True),
@@ -174,7 +219,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, block_size: int, n_layer: int, feat_dim: int, num_head: int,
                  pos_emb: str = "rope", rope_scale: float = 1.0, rope_method: str = "none",
                  dropout: float = 0.0, nope_every: int = 0, num_kv_head: int = None,
-                 num_expert: int = 0, tp_group=None, cp_group=None, grad_ckpt: bool = False):
+                 num_expert: int = 0, linear: str = None, full_every: int = 0, tp_group=None, cp_group=None,
+                 grad_ckpt: bool = False):
         super().__init__()
         self.grad_ckpt = grad_ckpt                   # recompute each block in backward to save memory
         self.tp_group = tp_group                     # TP + SP inside this group; None = one GPU
@@ -183,8 +229,11 @@ class GPT(nn.Module):
         self.max_len = int(block_size * rope_scale)                    # context allowed at inference
         self.tok_emb = nn.Embedding(vocab_size, feat_dim)
         nope = lambda i: nope_every and (i + 1) % nope_every == 0      # 4: every 4th layer (Llama 4, SmolLM3)
+        # linear="delta", full_every=4: three DeltaNet layers per softmax layer (Kimi Linear, Qwen3-Next)
+        kind = lambda i: linear if linear and (not full_every or (i + 1) % full_every) else "softmax"
         self.blocks = nn.ModuleList([TransformerBlock(feat_dim, num_head, num_kv_head, not nope(i), num_expert,
-                                                      dropout, tp_group, cp_group) for i in range(n_layer)])
+                                                      dropout, tp_group, cp_group, attn=kind(i))
+                                     for i in range(n_layer)])
         self.ln_f = LayerNorm(feat_dim)
         self.lm_head = nn.Linear(feat_dim, vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight                       # weight tying
@@ -206,7 +255,7 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, doc_ids=None, pos_ids=None, cache=None):
         S = idx.shape[1]                                               # my CP chunk (all of it without CP)
         c, cp = ranks(self.cp_group)[:2] if self.cp_group else (0, 1)
-        past = cache[0]["k"].shape[2] if cache and cache[0] else 0     # tokens already in the cache
+        past = max((c["k"].shape[2] for c in cache if "k" in c), default=0) if cache else 0   # tokens cached
         x = self.tok_emb(idx)                                          # (B, S, F)
         q_pos = past + c * S + torch.arange(S, device=idx.device)      # global positions of my tokens
         pos = pos_ids if pos_ids is not None else q_pos
