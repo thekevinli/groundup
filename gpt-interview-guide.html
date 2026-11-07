@@ -447,6 +447,15 @@ details.files[open]>summary{border-bottom:1px solid var(--line)}
 
 /* backprop: the sum / transpose rules, right under the chain rule */
 .g-card.rules{border-left:3px solid var(--sram)}
+
+/* study-style follow-ups: highlighted rules and compact tables */
+details.qa mark{background:color-mix(in srgb,var(--sram) 20%,transparent);color:inherit;padding:1px 4px;border-radius:3px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+details.qa .rule{line-height:1.7}
+details.qa .tbl{overflow-x:auto}
+details.qa table{border-collapse:collapse;width:100%;font-size:13.5px}
+details.qa th,details.qa td{text-align:left;vertical-align:top;padding:6px 10px 6px 0;border-top:1px solid var(--line)}
+details.qa thead th{border-top:0;font:600 11px/1.4 var(--f-code);letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+details.qa td:first-child{font-weight:600;white-space:nowrap}
 </style>
 
 <div class="shell" id="shell">
@@ -468,7 +477,7 @@ details.files[open]>summary{border-bottom:1px solid var(--line)}
     <details class="files">
   <summary>Files and imports</summary>
   <div class="files-grid">
-    <div class="ft"><div class="fh">Where files live</div><pre>gpt-interview-guide/
+    <div class="ft"><div class="fh">Where files live</div><pre>groundup/
 ├── gpt-interview-guide.html
 ├── README.md
 ├── files-and-imports.png
@@ -2882,6 +2891,7 @@ const GUIDE = [
   fig:'tpsp', figArg:'sp', figCap:'Toggle between TP and SP: the communication points move and the regions outside the TP layers become sequence-sharded.',
   run:'Run it: <code>python tp.py</code> checks the MLP with plain TP and with SP (sequence-split input, synced bias gradient) against one GPU.',
   qa:[
+    ['Why must randomness be controlled exactly under TP/SP/CP?', '<p class="rule"><mark>Replicas → <b>same</b> randomness on every TP rank. Shards → <b>independent</b> randomness per rank. Recompute → <b>replay</b> the same randomness.</mark></p><p><b>Why it breaks silently:</b> collectives assume replicas are identical. A row-parallel all-reduce sums \\(X W_i\\) pieces that must all come from the <i>same</i> \\(X\\). If randomness makes a “replica” differ, the collective still runs: <b>no error, just wrong numbers</b> (activations → loss → gradients), and the replicated weights drift apart.</p><div class="tbl"><table><thead><tr><th>Randomness</th><th>Applied to</th><th>Across TP ranks</th><th>If wrong</th></tr></thead><tbody><tr><td>Dropout</td><td>Replicated activation (residual stream, without SP)</td><td><b>Same</b></td><td>Forward is wrong: the next all-reduce sums pieces of different inputs</td></tr><tr><td>Dropout</td><td>Sharded activation (local heads; your tokens under SP/CP)</td><td><b>Different</b></td><td>Every shard drops the same pattern: correlated noise, a quality bug</td></tr><tr><td>Weight init</td><td>Sharded weights (column-/row-parallel)</td><td><b>Different</b></td><td>The full matrix is one block repeated</td></tr><tr><td>Weight init</td><td>Replicated weights (norms, row-parallel bias)</td><td><b>Same</b>, bitwise</td><td>tp different models sharing one all-reduced gradient</td></tr><tr><td>Data loader</td><td>The batch</td><td><b>Same</b> in TP/CP, <b>different</b> across DP</td><td>Every TP collective mixes different batches (classic bug: seeding by global rank)</td></tr><tr><td>Recompute</td><td>Dropout mask in activation checkpointing</td><td><b>Same as its own forward</b></td><td>Gradient for a mask the forward never used</td></tr></tbody></table></div><p><b>How Megatron does it:</b></p><ul><li><b>Two RNG streams:</b> the default one, seeded identically across the TP group, and a model-parallel one seeded with <code>seed + 2718 + tp_rank</code>.</li><li>Dropout on sharded tensors runs inside <code>with get_cuda_rng_tracker().fork():</code>; everything else uses the default stream.</li><li>Its checkpoint function saves and restores the CPU, CUDA and model-parallel RNG states, so recompute replays the masks. FlashAttention does the same for attention dropout: it stores the seed and offset.</li><li>Init: give each shard its own stream, or initialize the full weight once and slice it (what our test’s <code>load_shard</code> does).</li></ul><p><b>Not randomness, but related:</b></p><ul><li><b>Collective order</b> causes hangs (every rank must call the same collectives in the same order), not wrong values.</li><li><b>Nondeterministic kernels</b> (atomics, a different reduction order) can make replicas differ in the last bits and drift over thousands of steps. Use deterministic kernels where replicas must match, and checksum replicated params across ranks now and then. An all-reduce is safe here: every rank receives the same bits.</li></ul><p><b>In this guide:</b> the TP/SP/CP tests use <code>dropout=0</code> and load weights from one reference model, so none of this can bite there.</p><p class="rule"><mark><b>Interview line:</b> replicas need identical randomness, shards need independent randomness, recompute replays it, and data is the same within TP/CP but different across DP.</mark></p>'],
     ['Megatron-SP vs context parallelism?', '<p>Megatron-SP only shards the regions outside the TP layers; attention still sees the whole sequence on every rank. CP shards the sequence through attention itself.</p>'],
   ]
 },
