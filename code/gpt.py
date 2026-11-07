@@ -29,12 +29,14 @@ class LayerNorm(nn.Module):
 
 def sinusoidal_pe(seq_len: int, dim: int, base: float = 10000.0) -> torch.Tensor:
     # PE[p, 2i] = sin(p * w_i), PE[p, 2i+1] = cos(p * w_i), w_i = base^(-2i/dim): fast -> slow
-    pos = torch.arange(seq_len).float()[:, None]                      # (S, 1)
+    assert dim % 2 == 0
     w = base ** (-torch.arange(0, dim, 2).float() / dim)              # (dim/2,)
+    angles = torch.outer(torch.arange(seq_len).float(), w)            # (S, dim/2): angles[p, i] = p * w_i
     pe = torch.zeros(seq_len, dim)
-    pe[:, 0::2] = torch.sin(pos * w)
-    pe[:, 1::2] = torch.cos(pos * w)
-    return pe                                                         # (S, dim): added to token embeddings
+    pe[:, 0::2] = torch.sin(angles)
+    pe[:, 1::2] = torch.cos(angles)
+    return pe   # (S, dim), built once: GPT keeps it as a buffer (follows .to(device)), indexes it by
+                # pos (packed rows, KV-cache offsets) and casts to x's dtype
 
 
 def rope_freqs(head_dim: int, base: float = 10000.0, scale: float = 1.0,

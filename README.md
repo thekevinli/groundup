@@ -1,4 +1,6 @@
-# GPT interview guide
+# groundup
+
+Models built from the ground up, one diff at a time. First: a GPT, from attention to 3D parallelism and scaling laws.
 
 Open `gpt-interview-guide.html` in a browser (works offline). Its 40 interview-style steps build the files in `code/`, one change at a time.
 
