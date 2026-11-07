@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from collectives import ranks
 from cp import all_gather_kv
-from tp import ColumnParallelLinear, GatherFromSeq, RowParallelLinear, ScatterToSeq
+from tp import ColumnParallelLinear, RowParallelLinear, enter_sp, exit_sp
 
 
 class LayerNorm(nn.Module):
@@ -271,14 +271,14 @@ class GPT(nn.Module):
         if self.pos_emb == "rope":
             rope = rope_cos_sin(pos, self.freqs, self.mscale)
         if self.tp_group:
-            x = ScatterToSeq.apply(x, self.tp_group)                   # SP: my slice of the sequence
+            x = enter_sp(x, self.tp_group)                               # SP: my slice of the sequence
         for i, block in enumerate(self.blocks):
             if self.grad_ckpt and self.training:     # keep only the block input; rerun the block in backward
                 x = checkpoint(block, x, True, rope, mask, use_reentrant=False)
             else:
                 x = block(x, is_causal=True, rope=rope, attn_mask=mask, cache=cache[i] if cache else None)
         if self.tp_group:
-            x = GatherFromSeq.apply(x, self.tp_group)                  # full sequence for the head
+            x = exit_sp(x, self.tp_group)                                # full sequence for the head
         logits = self.lm_head(self.ln_f(x))                            # (B, S, vocab)
         loss = None
         if targets is not None:                                        # -100 = no loss; fp32 loss

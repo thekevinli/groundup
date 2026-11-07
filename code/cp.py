@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from collectives import all_gather, all_reduce, all_to_all, ring_send_recv
-from tp import AllGatherSeq
+from tp import gather_seq
 
 
 # ---------------- Ulysses: swap sequence-sharding for head-sharding around attention
@@ -47,7 +47,7 @@ class UlyssesAttention(nn.Module):
 # ---------------- all-gather CP: queries stay put, every rank gathers all keys and values
 def all_gather_kv(k: torch.Tensor, v: torch.Tensor, group=None):
     # (B, S/P, ...) -> (B, S, ...). Backward is a reduce-scatter: dK, dV go home summed (tp.py)
-    return AllGatherSeq.apply(k, group), AllGatherSeq.apply(v, group)
+    return gather_seq(k, group), gather_seq(v, group)
 
 
 # ---------------- Ring: K/V blocks travel around the ring, merged with FA2's online softmax

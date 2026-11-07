@@ -6,77 +6,39 @@ from torch.nn import functional as F
 from collectives import all_gather, all_reduce, ranks, reduce_scatter
 
 
-class CopyToTP(torch.autograd.Function):
-    # Megatron "f": identity forward; all-reduce backward (every rank consumed the same input)
+class Comm(torch.autograd.Function):
+    # a collective whose backward we pick by hand: SP communicates in BOTH directions, and the
+    # backward is always the forward's adjoint (all-gather <-> reduce-scatter, keep my slice <-> all-gather)
     @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        return all_reduce(grad, ctx.group), None
-
-
-class ReduceFromTP(torch.autograd.Function):
-    # Megatron "g": all-reduce forward (sum the partial outputs); identity backward
-    @staticmethod
-    def forward(ctx, x, group):
-        return all_reduce(x, group)
+    def forward(ctx, x, fwd, bwd):
+        ctx.bwd = bwd
+        return fwd(x)
 
     @staticmethod
     def backward(ctx, grad):
-        return grad, None
+        return ctx.bwd(grad), None, None
 
 
-class AllGatherSeq(torch.autograd.Function):
-    # SP "g": all-gather the sequence dim forward; reduce-scatter backward
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return all_gather(x, dim=1, group=group)
-
-    @staticmethod
-    def backward(ctx, grad):
-        return reduce_scatter(grad, dim=1, group=ctx.group), None
+def my_slice(t, group):
+    rank, world, _ = ranks(group)
+    return t.chunk(world, dim=1)[rank].contiguous()
 
 
-class ReduceScatterSeq(torch.autograd.Function):
-    # SP "g-bar": sum the partial outputs but keep only my slice of the sequence; all-gather backward
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return reduce_scatter(x, dim=1, group=group)
-
-    @staticmethod
-    def backward(ctx, grad):
-        return all_gather(grad, dim=1, group=ctx.group), None
+# the four SP boundaries along the sequence (dim 1), each a (forward, backward) pair
+def gather_seq(x, group):    # column input; CP's K/V
+    return Comm.apply(x, lambda t: all_gather(t, 1, group), lambda g: reduce_scatter(g, 1, group))
 
 
-class ScatterToSeq(torch.autograd.Function):
-    # enter SP: keep my slice of the sequence; backward all-gathers (what follows ran on every rank)
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        rank, world, _ = ranks(group)
-        return x.chunk(world, dim=1)[rank].contiguous()
-
-    @staticmethod
-    def backward(ctx, grad):
-        return all_gather(grad, dim=1, group=ctx.group), None
+def scatter_seq(x, group):   # row output: sum, keep my slice
+    return Comm.apply(x, lambda t: reduce_scatter(t, 1, group), lambda g: all_gather(g, 1, group))
 
 
-class GatherFromSeq(torch.autograd.Function):
-    # leave SP: all-gather the sequence; backward keeps my slice (every rank computed the same thing)
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return all_gather(x, dim=1, group=group)
+def enter_sp(x, group):      # after the embedding
+    return Comm.apply(x, lambda t: my_slice(t, group), lambda g: all_gather(g, 1, group))
 
-    @staticmethod
-    def backward(ctx, grad):
-        rank, world, _ = ranks(ctx.group)
-        return grad.chunk(world, dim=1)[rank].contiguous(), None
+
+def exit_sp(x, group):       # before the head
+    return Comm.apply(x, lambda t: all_gather(t, 1, group), lambda g: my_slice(g, group))
 
 
 class ColumnParallelLinear(nn.Linear):
@@ -87,24 +49,31 @@ class ColumnParallelLinear(nn.Linear):
         super().__init__(in_features, out_features // self.tp)
 
     def forward(self, x):
-        if self.tp > 1:
-            x = (AllGatherSeq if self.sp else CopyToTP).apply(x, self.group)
+        if self.tp > 1 and self.sp:
+            x = gather_seq(x, self.group)
+        elif self.tp > 1 and x.requires_grad:
+            # every rank used the same x, so dL/dx is the sum of every rank's piece: all-reduce it
+            x = x.view_as(x)                                   # own node: the hook sees only this layer's dL/dx
+            x.register_hook(lambda grad: all_reduce(grad, self.group))
         return super().forward(x)
 
 
 class RowParallelLinear(nn.Linear):
     # my 1/tp of the INPUT features, so every rank's output is a partial sum: all-reduce it (TP),
     # or reduce-scatter it to my slice of the sequence (SP). Same bytes, 1/tp of the activations.
+    # x arrives already split by features: it is the column layer's output, so nothing to slice or concat.
     def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
         self.group, self.tp, self.sp = group, ranks(group)[1] if group else 1, sequence_parallel
         super().__init__(in_features // self.tp, out_features)
         self.bias.sequence_parallel = sequence_parallel        # added in the SP region: see sync_sp_grads
 
     def forward(self, x):
-        if self.tp == 1:
-            return super().forward(x)
         y = F.linear(x, self.weight)
-        y = (ReduceScatterSeq if self.sp else ReduceFromTP).apply(y, self.group)
+        if self.tp > 1 and self.sp:
+            y = scatter_seq(y, self.group)
+        elif self.tp > 1:
+            # forward: the sum of every rank's partial output. backward: identity (y + sum - y)
+            y = all_reduce(y.detach(), self.group) + (y - y.detach())
         return y + self.bias                                   # added once, after the sum
 
 
