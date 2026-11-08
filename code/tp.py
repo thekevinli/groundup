@@ -3,7 +3,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from collectives import all_gather, all_reduce, init, launch, ranks, reduce_scatter
+from collectives import all_gather, all_reduce, init, launch, reduce_scatter
 
 
 class Comm(torch.autograd.Function):
@@ -20,7 +20,7 @@ class Comm(torch.autograd.Function):
 
 
 def my_slice(t, group):
-    rank, world, _ = ranks(group)
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
     return t.chunk(world, dim=1)[rank].contiguous()
 
 
@@ -45,7 +45,7 @@ class ColumnParallelLinear(nn.Linear):
     # my 1/tp of the OUTPUT features. Input: the same full x on every rank (TP), or
     # my slice of the sequence (SP), all-gathered here.
     def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
-        self.group, self.tp, self.sp = group, ranks(group)[1] if group else 1, sequence_parallel
+        self.group, self.tp, self.sp = group, dist.get_world_size(group) if group else 1, sequence_parallel
         super().__init__(in_features, out_features // self.tp)
 
     def forward(self, x):
@@ -63,7 +63,7 @@ class RowParallelLinear(nn.Linear):
     # or reduce-scatter it to my slice of the sequence (SP). Same bytes, 1/tp of the activations.
     # x arrives already split by features: it is the column layer's output, so nothing to slice or concat.
     def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
-        self.group, self.tp, self.sp = group, ranks(group)[1] if group else 1, sequence_parallel
+        self.group, self.tp, self.sp = group, dist.get_world_size(group) if group else 1, sequence_parallel
         super().__init__(in_features // self.tp, out_features)
         self.bias.sequence_parallel = sequence_parallel        # added in the SP region: see sync_sp_grads
 

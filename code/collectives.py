@@ -7,27 +7,18 @@ import torch.distributed as dist
 CUDA = "device=cuda" in sys.argv          # torchrun --nproc-per-node P <file> device=cuda: NCCL, one GPU each
 
 
-def ranks(group=None):
-    # a group is a subset of ranks (one TP group, one DP group, ...); None = every rank.
-    # Returns my rank in the group, its size, and group rank -> global rank for send/recv.
-    if group is None:
-        return dist.get_rank(), dist.get_world_size(), lambda r: r
-    return dist.get_rank(group), dist.get_world_size(group), lambda r: dist.get_global_rank(group, r)
-
-
 def ring_send_recv(send: torch.Tensor, recv: torch.Tensor, group=None) -> None:
-    # send to the right neighbour while receiving from the left one, posted as ONE batch: NCCL can
-    # deadlock on a separate send and recv (with 2 ranks both go to the same peer); gloo doesn't care
-    rank, world, glob = ranks(group)
-    for req in dist.batch_isend_irecv([dist.P2POp(dist.isend, send.contiguous(), glob((rank + 1) % world), group),
-                                       dist.P2POp(dist.irecv, recv, glob((rank - 1) % world), group)]):
-        req.wait()
+    # send to my right neighbour while receiving from my left one (ranks counted inside the group)
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    req = dist.isend(send.contiguous(), group=group, group_dst=(rank + 1) % world)   # returns at once
+    dist.recv(recv, group=group, group_src=(rank - 1) % world)                       # waits for the data
+    req.wait()
 
 
 def reduce_scatter(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
     # ring, P-1 steps: pass one partial sum right, add the one arriving from the left.
     # Afterwards rank r holds chunk r summed over all ranks.
-    rank, world, _ = ranks(group)
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
     chunks = [c.contiguous().clone() for c in x.chunk(world, dim=dim)]
     recv = torch.empty_like(chunks[0])
     for step in range(world - 1):
@@ -40,7 +31,7 @@ def reduce_scatter(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
 
 def all_gather(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
     # ring, P-1 steps: forward the chunk that arrived last step. Everyone ends with every chunk.
-    rank, world, _ = ranks(group)
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
     x = x.contiguous()
     chunks = [torch.empty_like(x) for _ in range(world)]
     chunks[rank] = x
@@ -53,7 +44,7 @@ def all_gather(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
 
 def all_reduce(x: torch.Tensor, group=None) -> torch.Tensor:
     # reduce-scatter then all-gather: each rank sends 2(P-1)/P * |x|, almost independent of P
-    world = ranks(group)[1]
+    world = dist.get_world_size(group)
     flat = x.flatten()
     flat = torch.cat([flat, flat.new_zeros((-flat.numel()) % world)])  # pad to a multiple of P
     return all_gather(reduce_scatter(flat, group=group), group=group)[: x.numel()].view_as(x)
@@ -62,18 +53,15 @@ def all_reduce(x: torch.Tensor, group=None) -> torch.Tensor:
 def all_to_all(chunks: list[torch.Tensor], recv_sizes: list[int], group=None) -> list[torch.Tensor]:
     # chunks[j] goes to rank j; returns the chunk every rank sent me. Round k: send to rank+k,
     # receive from rank-k. recv_sizes[j] = rows arriving from rank j (exchange counts first).
-    rank, world, glob = ranks(group)
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
     out = [None] * world
     out[rank] = chunks[rank]
     for k in range(1, world):
         dst, src = (rank + k) % world, (rank - k) % world
-        send = chunks[dst].contiguous()
-        recv = send.new_empty((recv_sizes[src], *send.shape[1:]))
-        ops = [dist.P2POp(dist.isend, send, glob(dst), group)] if send.numel() else []   # skip empty messages
-        ops += [dist.P2POp(dist.irecv, recv, glob(src), group)] if recv.numel() else []
-        for req in dist.batch_isend_irecv(ops) if ops else []:                          # one batch, as above
-            req.wait()
-        out[src] = recv
+        out[src] = chunks[dst].new_empty((recv_sizes[src], *chunks[dst].shape[1:]))
+        req = dist.isend(chunks[dst].contiguous(), group=group, group_dst=dst)
+        dist.recv(out[src], group=group, group_src=src)
+        req.wait()
     return out
 
 

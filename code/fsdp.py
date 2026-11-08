@@ -4,7 +4,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.utils.checkpoint import checkpoint
 
-from collectives import all_gather, init, launch, ranks, reduce_scatter
+from collectives import all_gather, init, launch, reduce_scatter
 
 
 class GatherParam(torch.autograd.Function):
@@ -12,7 +12,7 @@ class GatherParam(torch.autograd.Function):
     # so each rank keeps only its shard's gradient, averaged over ranks (each saw different data)
     @staticmethod
     def forward(ctx, shard, rows, group):
-        ctx.group, ctx.world = group, ranks(group)[1]
+        ctx.group, ctx.world = group, dist.get_world_size(group)
         ctx.pad = shard.shape[0] * ctx.world - rows
         return all_gather(shard, group=group)[:rows]
 
@@ -29,7 +29,7 @@ class FSDP(nn.Module):
     def __init__(self, module: nn.Module, group=None, reshard: bool = True):
         super().__init__()
         self.group, self.reshard = group, reshard                           # the data-parallel group
-        rank, world, _ = ranks(group)
+        rank, world = dist.get_rank(group), dist.get_world_size(group)
         self.names, self.rows = [], []
         self.shards = nn.ParameterList()
         self.inner = nn.ModuleList(m for m in module.modules() if isinstance(m, FSDP))  # wrapped already

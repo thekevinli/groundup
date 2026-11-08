@@ -17,7 +17,7 @@ HERE = pathlib.Path(__file__).parent
 REMOTE = "/root/code"
 app = modal.App("groundup-t4")
 image = (modal.Image.debian_slim(python_version="3.11")
-         .pip_install("torch==2.6.0", "numpy<2.3", "einops")
+         .pip_install("torch==2.8.0", "numpy<2.3", "einops")
          .add_local_dir(HERE, REMOTE, ignore=["gpt2_isoflop", "__pycache__", "*.json"]))   # input.txt too, if here
 
 

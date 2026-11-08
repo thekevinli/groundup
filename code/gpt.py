@@ -1,12 +1,13 @@
 import math
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
-from collectives import CUDA, init, launch, ranks
+from collectives import CUDA, init, launch
 from cp import all_gather_kv
 from tp import ColumnParallelLinear, RowParallelLinear, enter_sp, exit_sp
 
@@ -98,7 +99,7 @@ class MHSA(nn.Module):
         super().__init__()
         assert feat_dim % num_head == 0
         self.cp_group = cp_group
-        tp = ranks(tp_group)[1] if tp_group else 1
+        tp = dist.get_world_size(tp_group) if tp_group else 1
         num_kv_head = num_kv_head or num_head                             # GQA: H_kv < H, MQA: H_kv = 1
         assert num_head % num_kv_head == 0 and num_kv_head % tp == 0
         self.num_head, self.num_kv_head = num_head // tp, num_kv_head // tp   # TP: my heads only
@@ -246,7 +247,7 @@ class GPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, seqlist=None, cache=None):
         S = idx.shape[1]                                               # my CP chunk (all of it without CP)
-        c, cp = ranks(self.cp_group)[:2] if self.cp_group else (0, 1)
+        c, cp = (dist.get_rank(self.cp_group), dist.get_world_size(self.cp_group)) if self.cp_group else (0, 1)
         past = max((kv["k"].shape[2] for kv in cache if "k" in kv), default=0) if cache else 0   # tokens cached
         x = self.tok_emb(idx)                                          # (B, S, F)
         q_pos = past + c * S + torch.arange(S, device=idx.device)      # global positions of my tokens
