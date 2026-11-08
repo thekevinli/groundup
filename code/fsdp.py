@@ -4,22 +4,18 @@ from torch import nn
 from torch.func import functional_call
 from torch.utils.checkpoint import checkpoint
 
-from collectives import all_gather, init, launch, reduce_scatter
+from collectives import all_gather, all_reduce, init, launch
 
 
-class GatherParam(torch.autograd.Function):
-    # forward: all-gather a parameter's dim-0 shards. backward: reduce-scatter its full gradient,
-    # so each rank keeps only its shard's gradient, averaged over ranks (each saw different data)
-    @staticmethod
-    def forward(ctx, shard, rows, group):
-        ctx.group, ctx.world = group, dist.get_world_size(group)
-        ctx.pad = shard.shape[0] * ctx.world - rows
-        return all_gather(shard, group=group)[:rows]
-
-    @staticmethod
-    def backward(ctx, grad):
-        grad = torch.cat([grad, grad.new_zeros(ctx.pad, *grad.shape[1:])])
-        return reduce_scatter(grad, group=ctx.group) / ctx.world, None, None
+def gather_param(shard, rows, group):
+    # forward: all-gather a parameter's dim-0 shards. backward: each rank keeps only its shard's
+    # gradient, averaged over ranks (each saw different data). Same idiom as tp.py: a - a.detach() + b
+    P, r = dist.get_world_size(group), dist.get_rank(group)
+    padded = torch.cat([shard if i == r else torch.zeros_like(shard) for i in range(P)])   # my rows in place
+    if padded.requires_grad:
+        padded.register_hook(lambda g: all_reduce(g, group) / P)       # backward: average the full gradient
+    full = padded - padded.detach() + all_gather(shard.detach(), group=group)
+    return full[:rows]                                                  # drop the padding rows
 
 
 class FSDP(nn.Module):
@@ -57,7 +53,7 @@ class FSDP(nn.Module):
             return getattr(self.unit[0], name)
 
     def _run(self, args, kwargs, *shards):
-        full = {n: GatherParam.apply(s, r, self.group) for n, s, r in zip(self.names, shards, self.rows)}
+        full = {n: gather_param(s, r, self.group) for n, s, r in zip(self.names, shards, self.rows)}
         return functional_call(self.unit[0], full, args, kwargs)
 
     def forward(self, *args, **kwargs):

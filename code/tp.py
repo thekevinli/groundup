@@ -6,39 +6,37 @@ from torch.nn import functional as F
 from collectives import all_gather, all_reduce, init, launch, reduce_scatter
 
 
-class Comm(torch.autograd.Function):
-    # a collective whose backward we pick by hand: SP communicates in BOTH directions, and the
-    # backward is always the forward's adjoint (all-gather <-> reduce-scatter, keep my slice <-> all-gather)
-    @staticmethod
-    def forward(ctx, x, fwd, bwd):
-        ctx.bwd = bwd
-        return fwd(x)
-
-    @staticmethod
-    def backward(ctx, grad):
-        return ctx.bwd(grad), None, None
+# The four SP boundaries along the sequence (dim 1). One idiom throughout:
+#   a - a.detach() + b   ->  forward value b (our collective, no autograd), gradient flows into a
+# and the backward communication is a hook that runs our all_reduce on the gradient.
+def gather_seq(x, group):    # column input; CP's K/V: my S/P tokens -> all S
+    P, r = dist.get_world_size(group), dist.get_rank(group)
+    padded = torch.cat([x if i == r else torch.zeros_like(x) for i in range(P)], dim=1)
+    if padded.requires_grad:
+        padded.register_hook(lambda g: all_reduce(g, group))   # backward: sum every rank's grad for my tokens
+    return padded - padded.detach() + all_gather(x.detach(), 1, group)
 
 
-def my_slice(t, group):
-    rank, world = dist.get_rank(group), dist.get_world_size(group)
-    return t.chunk(world, dim=1)[rank].contiguous()
+def scatter_seq(y, group):   # row output: partial sums over all S -> the full sum for my S/P tokens
+    P, r = dist.get_world_size(group), dist.get_rank(group)
+    if y.requires_grad:
+        y.register_hook(lambda g: all_reduce(g, group))        # backward: my zero-padded grad -> everyone's grads
+    mine = y.chunk(P, dim=1)[r]
+    return mine - mine.detach() + reduce_scatter(y.detach(), 1, group)
 
 
-# the four SP boundaries along the sequence (dim 1), each a (forward, backward) pair
-def gather_seq(x, group):    # column input; CP's K/V
-    return Comm.apply(x, lambda t: all_gather(t, 1, group), lambda g: reduce_scatter(g, 1, group))
+def enter_sp(x, group):      # after the embedding: keep my S/P tokens
+    P, r = dist.get_world_size(group), dist.get_rank(group)
+    if x.requires_grad:
+        x = x.view_as(x)
+        x.register_hook(lambda g: all_reduce(g, group))        # backward: my zero-padded grad -> the full grad
+    return x.chunk(P, dim=1)[r]
 
 
-def scatter_seq(x, group):   # row output: sum, keep my slice
-    return Comm.apply(x, lambda t: reduce_scatter(t, 1, group), lambda g: all_gather(g, 1, group))
-
-
-def enter_sp(x, group):      # after the embedding
-    return Comm.apply(x, lambda t: my_slice(t, group), lambda g: all_gather(g, 1, group))
-
-
-def exit_sp(x, group):       # before the head
-    return Comm.apply(x, lambda t: all_gather(t, 1, group), lambda g: my_slice(g, group))
+def exit_sp(x, group):       # before the head: my S/P tokens -> all S (backward: keep my slice of the grad)
+    P, r = dist.get_world_size(group), dist.get_rank(group)
+    padded = torch.cat([x if i == r else torch.zeros_like(x) for i in range(P)], dim=1)
+    return padded - padded.detach() + all_gather(x.detach(), 1, group)
 
 
 class ColumnParallelLinear(nn.Linear):
@@ -72,8 +70,7 @@ class RowParallelLinear(nn.Linear):
         if self.tp > 1 and self.sp:
             y = scatter_seq(y, self.group)
         elif self.tp > 1:
-            # forward: the sum of every rank's partial output. backward: identity (y + sum - y)
-            y = all_reduce(y.detach(), self.group) + (y - y.detach())
+            y = y - y.detach() + all_reduce(y.detach(), self.group)   # forward: the sum; backward: identity
         return y + self.bias                                   # added once, after the sum
 
 

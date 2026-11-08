@@ -172,12 +172,13 @@ class MoE(nn.Module):
         gate = gate / gate.sum(dim=-1, keepdim=True)                     # renormalize over chosen experts
         out = torch.zeros_like(x)
         for e, expert in enumerate(self.experts):
-            tok, slot = (idx == e).nonzero(as_tuple=True)                # tokens that chose expert e
-            if len(tok):
-                out = out.index_add(0, tok, gate[tok, slot, None] * expert(x[tok]))
-        # Switch-style balance loss E * sum_e f_e * p_e (f: share of tokens routed, p: mean prob)
-        f = torch.bincount(idx.flatten(), minlength=len(self.experts)).float() / idx.numel()
-        self.aux_loss = len(self.experts) * (f * probs.mean(dim=0)).sum()
+            w = (gate * (idx == e)).sum(dim=-1)                          # (T,) each token's gate for e, 0 if not chosen
+            chosen = w > 0
+            if chosen.any():
+                out[chosen] += w[chosen, None] * expert(x[chosen])
+        # balance loss (Switch): E * sum_e (share of picks that went to e) * (mean router prob of e)
+        share = F.one_hot(idx, len(self.experts)).float().mean(dim=(0, 1))  # (E,)
+        self.aux_loss = len(self.experts) * (share * probs.mean(dim=0)).sum()
         return out.reshape(shape)
 
 

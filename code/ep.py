@@ -44,20 +44,22 @@ class EPMoE(nn.Module):
         exp = idx.flatten()
         order = torch.argsort(exp, stable=True)
         tok, exp = tok[order], exp[order]
-        send = torch.bincount(exp // self.local, minlength=world).tolist()
+        send = [int((exp // self.local == r).sum()) for r in range(world)]   # rows going to each rank
         recv = [int(c) for c in all_to_all(list(torch.tensor(send).split(1)), [1] * world)]  # counts first
         x_in = AllToAll.apply(x[tok], send, recv)                         # tokens for my experts
         e_in = torch.cat(all_to_all(list(exp.split(send)), recv)) - rank * self.local
         # 2. run my experts on whatever arrived
         y = torch.zeros_like(x_in)
         for e, expert in enumerate(self.experts):
-            sel = (e_in == e).nonzero(as_tuple=True)[0]
-            if len(sel):
-                y = y.index_add(0, sel, expert(x_in[sel]))
+            chosen = e_in == e
+            if chosen.any():
+                y[chosen] = expert(x_in[chosen])
         # 3. send results home, weight by the gate, sum each token's k choices
         y = AllToAll.apply(y, recv, send)
-        w = gate.flatten()[order]
-        return torch.zeros_like(x).index_add(0, tok, w[:, None] * y).reshape(shape)
+        out = torch.empty_like(y)
+        out[order] = y                                                    # undo the sort: row t*k + j = token t, choice j
+        out = out.view(len(x), self.top_k, -1)                            # (T, k, F)
+        return (gate[..., None] * out).sum(dim=1).reshape(shape)
 
 
 def _test(rank: int, world: int):
