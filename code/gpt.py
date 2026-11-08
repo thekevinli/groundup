@@ -309,11 +309,16 @@ def pack(tokens: torch.Tensor, pad_id: int = 0):
 
 
 def packed_mask_pos(seqlist: torch.Tensor):
-    # one packed row: attend only inside your own sequence (block-diagonal causal); positions restart at 0
-    seq = torch.repeat_interleave(torch.arange(len(seqlist), device=seqlist.device), seqlist)   # (N,) which sequence
-    pos = torch.arange(len(seq), device=seqlist.device) - (seqlist.cumsum(0) - seqlist)[seq]   # (N,) position in it
-    mask = (seq[:, None] == seq[None, :]).tril()                                                # (N, N), True = may attend
-    return mask, pos
+    # one packed row: causal inside each sequence only (block-diagonal), positions restart at 0
+    N, dev = int(seqlist.sum()), seqlist.device
+    mask = torch.zeros(N, N, dtype=torch.bool, device=dev)
+    pos = torch.zeros(N, dtype=torch.long, device=dev)
+    start = 0
+    for n in seqlist.tolist():
+        mask[start:start + n, start:start + n] = True              # this sequence sees only itself
+        pos[start:start + n] = torch.arange(n, device=dev)
+        start += n
+    return mask.tril(), pos
 
 
 # ---------------- check gradient checkpointing on one GPU: same gradients, less memory, more time
