@@ -3,7 +3,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from collectives import all_gather, all_reduce, ranks, reduce_scatter
+from collectives import all_gather, all_reduce, init, launch, ranks, reduce_scatter
 
 
 class Comm(torch.autograd.Function):
@@ -86,7 +86,7 @@ def sync_sp_grads(model: nn.Module, group):
 
 
 def _test(rank: int, tp: int):
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29502", rank=rank, world_size=tp)
+    init(rank, tp, 29502)
     torch.manual_seed(0)                                       # same full MLP and input everywhere
     full = nn.Sequential(nn.Linear(16, 64), nn.GELU(), nn.Linear(64, 16))
     x = torch.randn(2, 8, 16, requires_grad=True)
@@ -116,4 +116,4 @@ def _test(rank: int, tp: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(2,), nprocs=2)
+    launch(_test, 2)

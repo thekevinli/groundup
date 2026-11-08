@@ -4,7 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
 
-from collectives import all_gather, all_reduce, all_to_all, ring_send_recv
+from collectives import all_gather, all_reduce, all_to_all, init, launch, ring_send_recv
 from tp import gather_seq
 
 
@@ -126,7 +126,7 @@ def _check(attn, full, x, ref, rank, world, **kw):
 
 def _test(rank: int, world: int):
     from gpt import MHSA
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29503", rank=rank, world_size=world)
+    init(rank, world, 29503)
     torch.manual_seed(0)
     full = MHSA(16, 4)
     x = torch.randn(2, 16, 16, requires_grad=True)
@@ -147,4 +147,4 @@ def _test(rank: int, world: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(4,), nprocs=4)
+    launch(_test, 4)

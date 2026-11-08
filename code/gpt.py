@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
-from collectives import ranks
+from collectives import CUDA, init, launch, ranks
 from cp import all_gather_kv
 from tp import ColumnParallelLinear, RowParallelLinear, enter_sp, exit_sp
 
@@ -39,34 +39,27 @@ def sinusoidal_pe(seq_len: int, dim: int, base: float = 10000.0) -> torch.Tensor
                 # pos (packed rows, KV-cache offsets) and casts to x's dtype
 
 
-def rope_freqs(head_dim: int, base: float = 10000.0, scale: float = 1.0,
-               method: str = "none", train_len: int = 2048) -> torch.Tensor:
-    # theta_i = base^(-2i/hd): dim pair 0 spins fastest, the last pair slowest
-    freqs = base ** (-torch.arange(0, head_dim, 2).float() / head_dim)
+def apply_rope(x: torch.Tensor, pos: torch.Tensor = None, base: float = 10000.0,
+               scale: float = 1.0, method: str = "none", train_len: int = 2048) -> torch.Tensor:
+    # x: (B, H, S, hd). Rotate each pair (x[2i], x[2i+1]) by angle pos * theta_i, theta_i = base^(-2i/hd)
+    B, H, S, D = x.shape
+    if pos is None:
+        pos = torch.arange(S, device=x.device)                        # positions 0..S-1
+    if method == "ntk":     # NTK-aware: raise the base; high freqs barely move, lowest slows by `scale`
+        base = base * scale ** (D / (D - 2))
+    theta = base ** (-torch.arange(0, D, 2, device=x.device).float() / D)   # (hd/2,): pair 0 spins fastest
     if method == "pi":      # position interpolation: slow down every frequency by `scale`
-        freqs = freqs / scale
-    elif method == "ntk":   # NTK-aware: raise the base; high freqs barely move, lowest slows by `scale`
-        base = base * scale ** (head_dim / (head_dim - 2))
-        freqs = base ** (-torch.arange(0, head_dim, 2).float() / head_dim)
+        theta = theta / scale
     elif method == "yarn":  # YaRN: slow down only dims that turn < 1 time in train_len, ramp up to 32
-        turns = train_len * freqs / (2 * math.pi)
+        turns = train_len * theta / (2 * math.pi)
         keep = ((turns - 1) / (32 - 1)).clamp(0, 1)      # 1 = high freq, keep; 0 = low freq, interpolate
-        freqs = keep * freqs + (1 - keep) * freqs / scale
-    return freqs
-
-
-def rope_cos_sin(pos: torch.Tensor, freqs: torch.Tensor, mscale: float = 1.0):
-    angles = pos[..., None].float() * freqs                           # (S, hd/2), or (B, S, hd/2) packed
-    if angles.dim() == 3:
-        angles = angles[:, None]                                      # (B, 1, S, hd/2): shared by heads
-    return torch.cos(angles) * mscale, torch.sin(angles) * mscale    # YaRN: mscale sharpens attention
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # rotate each pair (x[2i], x[2i+1]) by angle pos * theta_i; x: (B, H, S, hd)
+        theta = keep * theta + (1 - keep) * theta / scale
+    angles = pos[..., None].float() * theta                           # (S, hd/2)
+    cos, sin = angles.cos(), angles.sin()
     x1, x2 = x[..., 0::2], x[..., 1::2]
     out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
-    return out.to(x.dtype)                                            # cos/sin are fp32
+    mscale = 0.1 * math.log(scale) + 1 if method == "yarn" else 1.0   # YaRN: sharper attention, logits x mscale^2
+    return (out * mscale).to(x.dtype)                                 # angles are fp32
 
 
 def linear_attention(q, k, v, state=None):
@@ -118,9 +111,9 @@ class MHSA(nn.Module):
         self.beta = nn.Linear(feat_dim, self.num_head) if kind == "delta" else None   # per-head write strength
         self.out = RowParallelLinear(feat_dim, feat_dim, tp_group, True)
 
-    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None,
+    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, pos=None, attn_mask=None,
                 cache=None) -> torch.Tensor:
-        # x: (B, S, F), my slice of S under SP; rope: (cos, sin) or None; attn_mask: bool, True = may attend
+        # x: (B, S, F), my slice of S under SP; rope: None or apply_rope settings; pos: positions; attn_mask: bool, True = may attend
         # cache: this layer's {"k", "v"} while decoding, or None
         q, k, v = self.qkv(x).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         q = rearrange(q, "b s (h f) -> b h s f", h=self.num_head)
@@ -139,7 +132,7 @@ class MHSA(nn.Module):
                 cache["state"] = state                                    # its whole cache: a fixed size
             return self.out(rearrange(o, "b h s f -> b s (h f)"))
         if rope is not None:                                              # rotate q and k, never v
-            q, k = apply_rope(q, *rope), apply_rope(k, *rope)
+            q, k = apply_rope(q, pos, **rope), apply_rope(k, pos, **rope)
         if cache is not None:                                             # decoding: past k, v + the new ones
             if "k" in cache:
                 k, v = torch.cat([cache["k"], k], dim=2), torch.cat([cache["v"], v], dim=2)
@@ -206,12 +199,12 @@ class TransformerBlock(nn.Module):
         for p in [*self.ln1.parameters(), *self.ln2.parameters()]:      # SP: norms see my slice of S
             p.sequence_parallel = tp_group is not None
 
-    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, attn_mask=None,
+    def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, pos=None, attn_mask=None,
                 cache=None) -> torch.Tensor:
         # pre-norm: the residual stream x is never normalized, so gradients have an identity path
         if not self.use_rope:
             rope = None                                                   # NoPE layer
-        x = x + self.drop(self.attention(self.ln1(x), is_causal, rope, attn_mask, cache))
+        x = x + self.drop(self.attention(self.ln1(x), is_causal, rope, pos, attn_mask, cache))
         x = x + self.drop(self.mlp(self.ln2(x)))
         return x
 
@@ -221,8 +214,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, block_size: int, n_layer: int, feat_dim: int, num_head: int,
                  pos_emb: str = "rope", rope_scale: float = 1.0, rope_method: str = "none",
                  dropout: float = 0.0, nope_every: int = 0, num_kv_head: int = None,
-                 num_expert: int = 0, linear: str = None, full_every: int = 0, tp_group=None, cp_group=None,
-                 grad_ckpt: bool = False):
+                 num_expert: int = 0, linear: str = None, full_every: int = 0, grad_ckpt: bool = False,
+                 tp_group=None, cp_group=None):
         super().__init__()
         self.grad_ckpt = grad_ckpt                   # recompute each block in backward to save memory
         self.tp_group = tp_group                     # TP + SP inside this group; None = one GPU
@@ -241,11 +234,8 @@ class GPT(nn.Module):
         self.lm_head.weight = self.tok_emb.weight                       # weight tying
         if pos_emb == "sin":
             self.register_buffer("pe", sinusoidal_pe(self.max_len, feat_dim), persistent=False)
-        if pos_emb == "rope":
-            freqs = rope_freqs(feat_dim // num_head, scale=rope_scale, method=rope_method,
-                               train_len=block_size)
-            self.register_buffer("freqs", freqs, persistent=False)
-            self.mscale = 0.1 * math.log(rope_scale) + 1 if rope_method == "yarn" else 1.0
+        # apply_rope settings for every layer; None = no RoPE
+        self.rope = dict(scale=rope_scale, method=rope_method, train_len=block_size) if pos_emb == "rope" else None
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -254,29 +244,28 @@ class GPT(nn.Module):
         if isinstance(m, nn.Linear) and m.bias is not None:
             nn.init.zeros_(m.bias)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, doc_ids=None, pos_ids=None, cache=None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, seqlist=None, cache=None):
         S = idx.shape[1]                                               # my CP chunk (all of it without CP)
         c, cp = ranks(self.cp_group)[:2] if self.cp_group else (0, 1)
-        past = max((c["k"].shape[2] for c in cache if "k" in c), default=0) if cache else 0   # tokens cached
+        past = max((kv["k"].shape[2] for kv in cache if "k" in kv), default=0) if cache else 0   # tokens cached
         x = self.tok_emb(idx)                                          # (B, S, F)
         q_pos = past + c * S + torch.arange(S, device=idx.device)      # global positions of my tokens
-        pos = pos_ids if pos_ids is not None else q_pos
-        mask = doc_mask(doc_ids) if doc_ids is not None else None      # packed rows; else plain causal
+        pos = q_pos
+        mask = None                                                    # plain causal
+        if seqlist is not None:                                        # one packed row, from pack()
+            mask, pos = packed_mask_pos(seqlist)
         if cp > 1:                                                     # CP: my queries vs every rank's keys
-            assert doc_ids is None and cache is None, "with CP, compare the gathered keys' doc ids too"
+            assert seqlist is None and cache is None, "packing with CP needs each rank's rows of the mask"
             mask = torch.arange(S * cp, device=idx.device)[None, :] <= q_pos[:, None]   # causal by position
-        rope = None
         if self.pos_emb == "sin":
             x = x + self.pe[pos].to(x.dtype)
-        if self.pos_emb == "rope":
-            rope = rope_cos_sin(pos, self.freqs, self.mscale)
         if self.tp_group:
             x = enter_sp(x, self.tp_group)                               # SP: my slice of the sequence
         for i, block in enumerate(self.blocks):
             if self.grad_ckpt and self.training:     # keep only the block input; rerun the block in backward
-                x = checkpoint(block, x, True, rope, mask, use_reentrant=False)
+                x = checkpoint(block, x, True, self.rope, pos, mask, use_reentrant=False)
             else:
-                x = block(x, is_causal=True, rope=rope, attn_mask=mask, cache=cache[i] if cache else None)
+                x = block(x, is_causal=True, rope=self.rope, pos=pos, attn_mask=mask, cache=cache[i] if cache else None)
         if self.tp_group:
             x = exit_sp(x, self.tp_group)                                # full sequence for the head
         logits = self.lm_head(self.ln_f(x))                            # (B, S, vocab)
@@ -300,32 +289,69 @@ class GPT(nn.Module):
         return idx
 
 
-def doc_mask(doc_ids: torch.Tensor) -> torch.Tensor:
-    # packed rows: causal AND same document, (B, 1, S, S), shared by heads
-    S = doc_ids.shape[1]
-    causal = torch.ones(S, S, dtype=torch.bool, device=doc_ids.device).tril()
-    return (causal & (doc_ids[:, :, None] == doc_ids[:, None, :]))[:, None]
+
+def pack(tokens: torch.Tensor, pad_id: int = 0):
+    # Pack (B, S) token IDs or (B, S, D) features in batch order.
+    # For features, a position is padding only if all D values equal pad_id.
+    # seqlist (B,) holds the number of retained positions in each sequence.
+    if tokens.ndim not in (2, 3):
+        raise ValueError("tokens must have shape (B, S) or (B, S, D)")
+
+    valid = tokens != pad_id
+    if tokens.ndim == 3:
+        valid = valid.any(dim=-1)
+
+    seqlist = valid.sum(dim=1)
+    packed_tokens = tokens[valid].unsqueeze(0)
+
+    return packed_tokens, seqlist
 
 
-def pack(docs: list[list[int]], seq_len: int, pad_id: int = 0):
-    # greedily put whole documents into rows of seq_len tokens (truncate long ones, pad the rest)
-    rows = [[]]
-    for d, doc in enumerate(docs):
-        doc = doc[:seq_len]
-        if len(rows[-1]) + len(doc) > seq_len:
-            rows.append([])
-        rows[-1] += [(tok, d, p) for p, tok in enumerate(doc)]      # (token, doc id, position in doc)
-    tokens = torch.full((len(rows), seq_len), pad_id)
-    doc_ids = torch.full((len(rows), seq_len), -1)                    # -1 = padding
-    pos_ids = torch.zeros((len(rows), seq_len), dtype=torch.long)
-    for b, row in enumerate(rows):
-        for s, (tok, d, p) in enumerate(row):
-            tokens[b, s], doc_ids[b, s], pos_ids[b, s] = tok, d, p
-    # next-token targets, but never predict across a document boundary or into padding
-    targets = torch.full_like(tokens, -100)
-    same_doc = (doc_ids[:, 1:] == doc_ids[:, :-1]) & (doc_ids[:, 1:] >= 0)
-    targets[:, :-1][same_doc] = tokens[:, 1:][same_doc]
-    return tokens, targets, doc_ids, pos_ids
+def packed_mask_pos(seqlist: torch.Tensor):
+    # one packed row: attend only inside your own sequence (block-diagonal causal); positions restart at 0
+    seq = torch.repeat_interleave(torch.arange(len(seqlist), device=seqlist.device), seqlist)   # (N,) which sequence
+    pos = torch.arange(len(seq), device=seqlist.device) - (seqlist.cumsum(0) - seqlist)[seq]   # (N,) position in it
+    mask = (seq[:, None] == seq[None, :]).tril()                                                # (N, N), True = may attend
+    return mask, pos
+
+
+# ---------------- check gradient checkpointing on one GPU: same gradients, less memory, more time
+def saved_bytes(model: nn.Module, idx: torch.Tensor, targets: torch.Tensor) -> int:
+    # activation memory: the tensors autograd keeps for backward, minus the weights, each storage once
+    weights = {p.untyped_storage().data_ptr() for p in model.parameters()}
+    kept = {}
+    def pack(t):
+        s = t.untyped_storage()
+        if s.data_ptr() not in weights:
+            kept[s.data_ptr()] = s.nbytes()
+        return t
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        _, loss = model(idx, targets)
+    loss.backward()
+    return sum(kept.values())
+
+
+def _test_ckpt():
+    import time
+    cfg = dict(vocab_size=65, block_size=128, n_layer=6, feat_dim=384, num_head=6, dropout=0.2)   # train.py's
+    idx, tgt = torch.randint(0, 65, (32, 128)), torch.randint(0, 65, (32, 128))                    # one batch
+    out = {}
+    for ckpt in (False, True):
+        torch.manual_seed(0)                                           # same weights, same dropout masks
+        model = GPT(**cfg, grad_ckpt=ckpt)
+        mem = saved_bytes(model, idx, tgt)
+        grads = [p.grad.clone() for p in model.parameters()]
+        start = time.time()
+        for _ in range(3):
+            model(idx, tgt)[1].backward()
+        out[ckpt] = mem, (time.time() - start) / 3, grads
+    (mem0, sec0, g0), (mem1, sec1, g1) = out[False], out[True]
+    diff = max((a - b).abs().max().item() for a, b in zip(g0, g1))
+    assert diff < 1e-6                                                 # the recompute replays dropout's masks
+    print(f"train.py's model (10.7M), one 32 x 128 batch, fp32: grad_ckpt=True vs False\n"
+          f"  max gradient difference {diff:.1e}, with dropout 0.2\n"
+          f"  kept for backward       {mem0 / 1e6:6.1f} MB -> {mem1 / 1e6:5.1f} MB\n"
+          f"  forward + backward      {sec0:6.2f} s  -> {sec1:5.2f} s  ({sec1 / sec0:.2f}x)")
 
 
 # ---------------- check the parallel GPT against one GPU, and measure memory per GPU
@@ -368,7 +394,7 @@ def load_tp(model: GPT, ref: GPT, t: int, tp: int):
 
 
 def activations(tokens: int, tp: int, cfg: dict) -> int:
-    # bytes per GPU: 34 * s * b * h per layer with FlashAttention (budget.py), divided by TP/SP
+    # bytes per GPU: 34 * s * b * h per layer with FlashAttention (Korthikanti et al.), divided by TP/SP
     return 34 * tokens * cfg["feat_dim"] * cfg["n_layer"] // tp
 
 
@@ -383,7 +409,7 @@ def _test(rank: int, world: int, dp: int, cp: int, tp: int):
     from collectives import all_reduce
     from fsdp import fully_shard
     from tp import sync_sp_grads
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29508", rank=rank, world_size=world)
+    init(rank, world, 29508)
     m = mesh(dp, cp, tp)
     cfg = dict(vocab_size=64, block_size=16, n_layer=2, feat_dim=32, num_head=4)
     torch.manual_seed(0)                                               # same data and weights everywhere
@@ -418,7 +444,7 @@ def _report(rank: int, world: int, dp: int, cp: int, tp: int, seq: int):
     # GPT-2 small built on the meta device: real shapes and shards, no memory allocated
     import torch.distributed as dist
     from fsdp import fully_shard
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29510", rank=rank, world_size=world)
+    init(rank, world, 29510)
     m = mesh(dp, cp, tp)
     with torch.device("meta"):
         one = states(GPT(**GPT2_SMALL))
@@ -433,6 +459,9 @@ def _report(rank: int, world: int, dp: int, cp: int, tp: int, seq: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(8, 2, 2, 2), nprocs=8)
-    for dp, cp in ((4, 1), (2, 2), (1, 4)):                            # 8 GPUs, TP 2 throughout
-        torch.multiprocessing.spawn(_report, args=(8, dp, cp, 2, 131072), nprocs=8)
+    if not CUDA:
+        _test_ckpt()                                                   # one device: CPU
+    launch(_test, 8, 2, 2, 2)                                          # GPUs: torchrun --nproc-per-node 8 gpt.py device=cuda
+    if not CUDA:                                                       # meta device: CPU
+        for dp, cp in ((4, 1), (2, 2), (1, 4)):                        # 8 GPUs, TP 2 throughout
+            torch.multiprocessing.spawn(_report, args=(8, dp, cp, 2, 131072), nprocs=8)

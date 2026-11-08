@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from collectives import all_reduce, all_to_all
+from collectives import all_reduce, all_to_all, init, launch
 from gpt import MoE
 
 
@@ -61,7 +61,7 @@ class EPMoE(nn.Module):
 
 
 def _test(rank: int, world: int):
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29505", rank=rank, world_size=world)
+    init(rank, world, 29505)
     torch.manual_seed(0)
     full = MoE(16, num_expert=8, top_k=2)                                # same weights everywhere
     x = torch.randn(world, 6, 16)                                        # 6 tokens per rank
@@ -87,4 +87,4 @@ def _test(rank: int, world: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(4,), nprocs=4)
+    launch(_test, 4)

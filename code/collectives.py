@@ -1,5 +1,10 @@
+import os
+import sys
+
 import torch
 import torch.distributed as dist
+
+CUDA = "device=cuda" in sys.argv          # torchrun --nproc-per-node P <file> device=cuda: NCCL, one GPU each
 
 
 def ranks(group=None):
@@ -11,12 +16,12 @@ def ranks(group=None):
 
 
 def ring_send_recv(send: torch.Tensor, recv: torch.Tensor, group=None) -> None:
-    # send to the right neighbour while receiving from the left one
+    # send to the right neighbour while receiving from the left one, posted as ONE batch: NCCL can
+    # deadlock on a separate send and recv (with 2 ranks both go to the same peer); gloo doesn't care
     rank, world, glob = ranks(group)
-    send = send.contiguous()
-    req = dist.isend(send, dst=glob((rank + 1) % world), group=group)
-    dist.recv(recv, src=glob((rank - 1) % world), group=group)
-    req.wait()
+    for req in dist.batch_isend_irecv([dist.P2POp(dist.isend, send.contiguous(), glob((rank + 1) % world), group),
+                                       dist.P2POp(dist.irecv, recv, glob((rank - 1) % world), group)]):
+        req.wait()
 
 
 def reduce_scatter(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
@@ -64,13 +69,32 @@ def all_to_all(chunks: list[torch.Tensor], recv_sizes: list[int], group=None) ->
         dst, src = (rank + k) % world, (rank - k) % world
         send = chunks[dst].contiguous()
         recv = send.new_empty((recv_sizes[src], *send.shape[1:]))
-        req = dist.isend(send, dst=glob(dst), group=group) if send.numel() else None   # skip empty messages
-        if recv.numel():
-            dist.recv(recv, src=glob(src), group=group)
-        if req:
+        ops = [dist.P2POp(dist.isend, send, glob(dst), group)] if send.numel() else []   # skip empty messages
+        ops += [dist.P2POp(dist.irecv, recv, glob(src), group)] if recv.numel() else []
+        for req in dist.batch_isend_irecv(ops) if ops else []:                          # one batch, as above
             req.wait()
         out[src] = recv
     return out
+
+
+def init(rank: int, world: int, port: int) -> None:
+    # the tests' process group: gloo over TCP between the CPU processes launch() spawned, or, with
+    # device=cuda under torchrun, NCCL with one GPU per process (torchrun sets rank and world)
+    if CUDA:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        torch.set_default_device("cuda")                              # the test's tensors and modules
+        dist.init_process_group("nccl")
+        assert dist.get_world_size() == world, f"launch {world} processes"
+    else:
+        dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
+
+
+def launch(test, world: int, *args) -> None:
+    # python <file>: spawn world CPU processes. torchrun ... <file> device=cuda: they exist, run my rank
+    if CUDA:
+        test(int(os.environ["RANK"]), world, *args)
+    else:
+        torch.multiprocessing.spawn(test, args=(world, *args), nprocs=world)
 
 
 # Adjoints: every collective is a linear map, so its backward is the transposed map.
@@ -80,7 +104,7 @@ def all_to_all(chunks: list[torch.Tensor], recv_sizes: list[int], group=None) ->
 
 
 def _test(rank: int, world: int):
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29501", rank=rank, world_size=world)
+    init(rank, world, 29501)
     torch.manual_seed(rank)
     x = torch.randn(world * 2, 3)
     everyone = [torch.empty_like(x) for _ in range(world)]
@@ -102,4 +126,4 @@ def _test(rank: int, world: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(4,), nprocs=4)
+    launch(_test, 4)

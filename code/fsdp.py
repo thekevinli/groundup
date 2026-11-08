@@ -4,7 +4,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.utils.checkpoint import checkpoint
 
-from collectives import all_gather, ranks, reduce_scatter
+from collectives import all_gather, init, launch, ranks, reduce_scatter
 
 
 class GatherParam(torch.autograd.Function):
@@ -77,7 +77,7 @@ def fully_shard(model: nn.Module, group=None) -> FSDP:
 
 def _test(rank: int, world: int):
     from gpt import TransformerBlock
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29504", rank=rank, world_size=world)
+    init(rank, world, 29504)
     torch.manual_seed(0)
     blocks = [TransformerBlock(18, 3) for _ in range(2)]                # 18 rows: not divisible by 4
     x = torch.randn(world * 2, 8, 18)                                   # global batch
@@ -106,4 +106,4 @@ def _test(rank: int, world: int):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.spawn(_test, args=(4,), nprocs=4)
+    launch(_test, 4)

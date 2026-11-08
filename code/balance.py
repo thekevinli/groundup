@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
 
-from collectives import all_gather, all_to_all
+from collectives import CUDA, all_gather, all_to_all, init, launch
 
 D = 3072                                      # model width (Flux-sized)
 
@@ -108,7 +108,7 @@ def _simulate(name: str, sizes: list, weights: list, per_gpu: int, P: int = 32, 
 
 
 def _test_routing(rank: int, world: int):
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29507", rank=rank, world_size=world)
+    init(rank, world, 29507)
     torch.manual_seed(rank)
     seqs = [torch.randn(int(torch.randint(4, 60, ())), 8) for _ in range(1 + 3 * rank)]   # uneven ranks
     tokens, state = route(seqs, bags=[1, 1, 2])
@@ -123,10 +123,11 @@ def _test_routing(rank: int, world: int):
 
 
 if __name__ == "__main__":
-    # 256px, 1k and 2k images (256, 4k, 16k tokens after an 8x VAE and 2x2 patches), 8 per GPU
-    r = _simulate("mixed-resolution images", [256, 4096, 16384], [70, 22, 8], per_gpu=8)
-    assert r["balance cost"] < r["balance tokens"] < r["same samples per GPU"]
-    # add the odd 96k-token video, 4 samples per GPU: no single GPU can take its share
-    r = _simulate("images + video", [256, 4096, 16384, 98304], [70, 20, 8, 2], per_gpu=4)
-    assert r["balance cost, 8-GPU bags"] < 1.05 < r["balance cost"]     # one GPU can't hold the video's share
-    torch.multiprocessing.spawn(_test_routing, args=(4,), nprocs=4)
+    if not CUDA:                                                       # arithmetic: no GPU needed
+        # 256px, 1k and 2k images (256, 4k, 16k tokens after an 8x VAE and 2x2 patches), 8 per GPU
+        r = _simulate("mixed-resolution images", [256, 4096, 16384], [70, 22, 8], per_gpu=8)
+        assert r["balance cost"] < r["balance tokens"] < r["same samples per GPU"]
+        # add the odd 96k-token video, 4 samples per GPU: no single GPU can take its share
+        r = _simulate("images + video", [256, 4096, 16384, 98304], [70, 20, 8, 2], per_gpu=4)
+        assert r["balance cost, 8-GPU bags"] < 1.05 < r["balance cost"]     # one GPU can't hold the video's share
+    launch(_test_routing, 4)
