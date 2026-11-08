@@ -8,7 +8,7 @@ CUDA = "device=cuda" in sys.argv          # torchrun --nproc-per-node P <file> d
 
 
 def ring_send_recv(send: torch.Tensor, recv: torch.Tensor, group=None) -> None:
-    # send to my right neighbour while receiving from my left one (ranks counted inside the group)
+    # send right, receive from the left. NCCL: use dist.batch_isend_irecv, or 2 ranks can deadlock
     rank, world = dist.get_rank(group), dist.get_world_size(group)
     req = dist.isend(send.contiguous(), group=group, group_dst=(rank + 1) % world)   # returns at once
     dist.recv(recv, group=group, group_src=(rank - 1) % world)                       # waits for the data
@@ -18,11 +18,15 @@ def ring_send_recv(send: torch.Tensor, recv: torch.Tensor, group=None) -> None:
 def reduce_scatter(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
     # ring, P-1 steps: pass one partial sum right, add the one arriving from the left.
     # Afterwards rank r holds chunk r summed over all ranks.
+    # in training: dist.reduce_scatter(out, list(x.chunk(P)), group=group)
     rank, world = dist.get_rank(group), dist.get_world_size(group)
+    # send/recv ship one flat block of memory; a chunk along dim>0 is a strided view. clone: we add into it
     chunks = [c.contiguous().clone() for c in x.chunk(world, dim=dim)]
     recv = torch.empty_like(chunks[0])
     for step in range(world - 1):
+        # chunk index, not a rank; the -1 makes me end on chunk `rank` after P-1 steps
         send_i = (rank - step - 1) % world
+        # my left neighbour's send_i: (rank - 1) - step - 1
         recv_i = (rank - step - 2) % world
         ring_send_recv(chunks[send_i], recv, group)
         chunks[recv_i] += recv
@@ -31,7 +35,9 @@ def reduce_scatter(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
 
 def all_gather(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
     # ring, P-1 steps: forward the chunk that arrived last step. Everyone ends with every chunk.
+    # in training: dist.all_gather(out_list, x, group=group)
     rank, world = dist.get_rank(group), dist.get_world_size(group)
+    # send/recv ship one flat block of memory, so a strided view (e.g. a transpose or slice) must be copied first
     x = x.contiguous()
     chunks = [torch.empty_like(x) for _ in range(world)]
     chunks[rank] = x
@@ -44,15 +50,19 @@ def all_gather(x: torch.Tensor, dim: int = 0, group=None) -> torch.Tensor:
 
 def all_reduce(x: torch.Tensor, group=None) -> torch.Tensor:
     # reduce-scatter then all-gather: each rank sends 2(P-1)/P * |x|, almost independent of P
+    # in training: dist.all_reduce(x, group=group)
     world = dist.get_world_size(group)
-    flat = x.flatten()
-    flat = torch.cat([flat, flat.new_zeros((-flat.numel()) % world)])  # pad to a multiple of P
-    return all_gather(reduce_scatter(flat, group=group), group=group)[: x.numel()].view_as(x)
+    # any shape: flatten to 1-D and zero-pad so it splits into P equal chunks
+    pad = -x.numel() % world
+    flat = torch.cat([x.flatten(), x.new_zeros(pad)])
+    out = all_gather(reduce_scatter(flat, group=group), group=group)
+    return out[: x.numel()].reshape(x.shape)                          # drop the padding, restore the shape
 
 
 def all_to_all(chunks: list[torch.Tensor], recv_sizes: list[int], group=None) -> list[torch.Tensor]:
     # chunks[j] goes to rank j; returns the chunk every rank sent me. Round k: send to rank+k,
     # receive from rank-k. recv_sizes[j] = rows arriving from rank j (exchange counts first).
+    # in training: dist.all_to_all(out_list, chunks, group=group)
     rank, world = dist.get_rank(group), dist.get_world_size(group)
     out = [None] * world
     out[rank] = chunks[rank]
