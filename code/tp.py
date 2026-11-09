@@ -39,39 +39,29 @@ def exit_sp(x, group):       # before the head: my S/P tokens -> all S (backward
     return padded - padded.detach() + all_gather(x.detach(), 1, group)
 
 
-class ColumnParallelLinear(nn.Linear):
-    # my 1/tp of the OUTPUT features. Input: the same full x on every rank (TP), or
-    # my slice of the sequence (SP), all-gathered here.
-    def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
-        self.group, self.tp, self.sp = group, dist.get_world_size(group) if group else 1, sequence_parallel
-        super().__init__(in_features, out_features // self.tp)
-
-    def forward(self, x):
-        if self.tp > 1 and self.sp:
-            x = gather_seq(x, self.group)
-        elif self.tp > 1 and x.requires_grad:
-            # every rank used the same x, so dL/dx is the sum of every rank's piece: all-reduce it
-            x = x.view_as(x)                                   # own node: the hook sees only this layer's dL/dx
-            x.register_hook(lambda grad: all_reduce(grad, self.group))
-        return super().forward(x)
+def column_parallel(x, w_local, b_local, group, sp=False):
+    # I own out/P output features. TP: the same full x on every rank. SP: my S/P tokens, gathered here
+    if group is None:
+        return F.linear(x, w_local, b_local)                   # one GPU
+    if sp:
+        x = gather_seq(x, group)                               # its backward already sums every rank's grad
+    elif x.requires_grad:
+        x = x.view_as(x)                                       # own node: the hook sees only this layer's dL/dx
+        x.register_hook(lambda g: all_reduce(g, group))        # backward: sum every rank's partial dL/dx
+    return F.linear(x, w_local, b_local)
 
 
-class RowParallelLinear(nn.Linear):
-    # my 1/tp of the INPUT features, so every rank's output is a partial sum: all-reduce it (TP),
-    # or reduce-scatter it to my slice of the sequence (SP). Same bytes, 1/tp of the activations.
-    # x arrives already split by features: it is the column layer's output, so nothing to slice or concat.
-    def __init__(self, in_features: int, out_features: int, group=None, sequence_parallel: bool = False):
-        self.group, self.tp, self.sp = group, dist.get_world_size(group) if group else 1, sequence_parallel
-        super().__init__(in_features // self.tp, out_features)
-        self.bias.sequence_parallel = sequence_parallel        # added in the SP region: see sync_sp_grads
-
-    def forward(self, x):
-        y = F.linear(x, self.weight)
-        if self.tp > 1 and self.sp:
-            y = scatter_seq(y, self.group)
-        elif self.tp > 1:
-            y = y - y.detach() + all_reduce(y.detach(), self.group)   # forward: the sum; backward: identity
-        return y + self.bias                                   # added once, after the sum
+def row_parallel(x_local, w_local, bias, group, sp=False):
+    # x_local = my in/P features (the column layer's output: nothing to slice); outputs are partial sums.
+    # TP: all-reduce them. SP: reduce-scatter to my S/P tokens (same bytes, 1/P of the activations)
+    y = F.linear(x_local, w_local)
+    if group is None:
+        return y + bias
+    if sp:
+        y = scatter_seq(y, group)
+    else:
+        y = y - y.detach() + all_reduce(y.detach(), group)     # forward: the sum; backward: identity
+    return y + bias                                            # bias once, after the sum (SP: mark it, see below)
 
 
 def sync_sp_grads(model: nn.Module, group):
@@ -92,21 +82,21 @@ def _test(rank: int, tp: int):
     group = dist.group.WORLD                                   # all ranks form the TP group here
     h = slice(rank * 64 // tp, (rank + 1) * 64 // tp)          # my hidden units
     for sp in (False, True):
-        mlp = nn.Sequential(ColumnParallelLinear(16, 64, group, sp), nn.GELU(), RowParallelLinear(64, 16, group, sp))
-        with torch.no_grad():
-            mlp[0].weight.copy_(full[0].weight[h]); mlp[0].bias.copy_(full[0].bias[h])
-            mlp[2].weight.copy_(full[2].weight[:, h]); mlp[2].bias.copy_(full[2].bias)
+        w1, b1 = full[0].weight[h].detach().clone().requires_grad_(), full[0].bias[h].detach().clone()
+        w2 = full[2].weight[:, h].detach().clone().requires_grad_()
+        b2 = nn.Parameter(full[2].bias.detach().clone())
+        b2.sequence_parallel = sp                              # added on my slice of S under SP
         mine = (lambda t: t.chunk(tp, dim=1)[rank]) if sp else (lambda t: t)   # SP: my slice of S
         xs = mine(x.detach()).clone().requires_grad_()
-        out = mlp(xs)
+        out = row_parallel(F.gelu(column_parallel(xs, w1, b1, group, sp)), w2, b2, group, sp)
         (out ** 2).sum().backward()
         if sp:
-            sync_sp_grads(mlp, group)                          # without it the bias grad is 1/tp short
+            b2.grad = all_reduce(b2.grad, group)               # sync_sp_grads: without it the bias grad is 1/tp short
         assert torch.allclose(out, mine(full(x)), atol=1e-5)
         assert torch.allclose(xs.grad, mine(x.grad), atol=1e-5)
-        assert torch.allclose(mlp[0].weight.grad, full[0].weight.grad[h], atol=1e-5)
-        assert torch.allclose(mlp[2].weight.grad, full[2].weight.grad[:, h], atol=1e-5)
-        assert torch.allclose(mlp[2].bias.grad, full[2].bias.grad, atol=1e-5)
+        assert torch.allclose(w1.grad, full[0].weight.grad[h], atol=1e-5)
+        assert torch.allclose(w2.grad, full[2].weight.grad[:, h], atol=1e-5)
+        assert torch.allclose(b2.grad, full[2].bias.grad, atol=1e-5)
         if rank == 0:
             print(("SP" if sp else "TP"), "MLP (column -> GELU -> row) matches the single-GPU MLP")
     dist.destroy_process_group()

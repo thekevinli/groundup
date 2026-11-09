@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 from collectives import CUDA, init, launch
 from cp import all_gather_kv
-from tp import ColumnParallelLinear, RowParallelLinear, enter_sp, exit_sp
+from tp import column_parallel, enter_sp, exit_sp, row_parallel
 
 
 class LayerNorm(nn.Module):
@@ -108,15 +108,18 @@ class MHSA(nn.Module):
         assert kind == "softmax" or (tp == 1 and not cp_group), "linear attention here is single-GPU"
         self.q_dim, self.kv_dim = self.num_head * self.head_dim, self.num_kv_head * self.head_dim
         # q: F, k and v: H_kv * hd each. TP: columns = my heads' q, k, v; rows of out = my heads
-        self.qkv = ColumnParallelLinear(feat_dim, feat_dim + 2 * num_kv_head * self.head_dim, tp_group, True)
+        self.tp_group = tp_group
+        self.qkv = nn.Linear(feat_dim, (feat_dim + 2 * num_kv_head * self.head_dim) // tp)   # column-parallel
         self.beta = nn.Linear(feat_dim, self.num_head) if kind == "delta" else None   # per-head write strength
-        self.out = RowParallelLinear(feat_dim, feat_dim, tp_group, True)
+        self.out = nn.Linear(feat_dim // tp, feat_dim)                                      # row-parallel
+        self.out.bias.sequence_parallel = tp_group is not None                              # SP: added on my slice of S
 
     def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, pos=None, attn_mask=None,
                 cache=None) -> torch.Tensor:
         # x: (B, S, F), my slice of S under SP; rope: None or apply_rope settings; pos: positions; attn_mask: bool, True = may attend
         # cache: this layer's {"k", "v"} while decoding, or None
-        q, k, v = self.qkv(x).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        qkv = column_parallel(x, self.qkv.weight, self.qkv.bias, self.tp_group, sp=True)
+        q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         q = rearrange(q, "b s (h f) -> b h s f", h=self.num_head)
         k = rearrange(k, "b s (h f) -> b h s f", h=self.num_kv_head)
         v = rearrange(v, "b s (h f) -> b h s f", h=self.num_kv_head)
@@ -131,7 +134,7 @@ class MHSA(nn.Module):
                 o, state = delta_rule(q, k, v, torch.sigmoid(self.beta(x)).transpose(1, 2), state)
             if cache is not None:
                 cache["state"] = state                                    # its whole cache: a fixed size
-            return self.out(rearrange(o, "b h s f -> b s (h f)"))
+            return row_parallel(rearrange(o, "b h s f -> b s (h f)"), self.out.weight, self.out.bias, self.tp_group, sp=True)
         if rope is not None:                                              # rotate q and k, never v
             q, k = apply_rope(q, pos, **rope), apply_rope(k, pos, **rope)
         if cache is not None:                                             # decoding: past k, v + the new ones
@@ -151,7 +154,7 @@ class MHSA(nn.Module):
         if attn_mask is not None:
             score = score.masked_fill(~attn_mask, float("-inf"))          # before softmax
         attn = torch.softmax(score.float(), dim=-1).to(v.dtype) @ v       # softmax in fp32; (B, H, S, hd)
-        return self.out(rearrange(attn, "b h s f -> b s (h f)"))
+        return row_parallel(rearrange(attn, "b h s f -> b s (h f)"), self.out.weight, self.out.bias, self.tp_group, sp=True)
 
 
 class MoE(nn.Module):
@@ -193,12 +196,14 @@ class TransformerBlock(nn.Module):
         self.ln1 = LayerNorm(feat_dim)
         self.attention = MHSA(feat_dim, num_head, num_kv_head, tp_group, cp_group, kind=attn)
         self.ln2 = LayerNorm(feat_dim)
+        self.tp_group, tp = tp_group, dist.get_world_size(tp_group) if tp_group else 1
         self.mlp = MoE(feat_dim, num_expert) if num_expert else nn.Sequential(
-            ColumnParallelLinear(feat_dim, feat_dim * 4, tp_group, True),
+            nn.Linear(feat_dim, feat_dim * 4 // tp),             # column-parallel: my 1/tp of the hidden units
             nn.GELU(),
-            RowParallelLinear(feat_dim * 4, feat_dim, tp_group, True),
+            nn.Linear(feat_dim * 4 // tp, feat_dim),             # row-parallel
         )
-        for p in [*self.ln1.parameters(), *self.ln2.parameters()]:      # SP: norms see my slice of S
+        sp_params = [*self.ln1.parameters(), *self.ln2.parameters()] + ([] if num_expert else [self.mlp[2].bias])
+        for p in sp_params:                                      # SP: norms and the row bias see my slice of S
             p.sequence_parallel = tp_group is not None
 
     def forward(self, x: torch.Tensor, is_causal: bool = False, rope=None, pos=None, attn_mask=None,
@@ -207,7 +212,14 @@ class TransformerBlock(nn.Module):
         if not self.use_rope:
             rope = None                                                   # NoPE layer
         x = x + self.drop(self.attention(self.ln1(x), is_causal, rope, pos, attn_mask, cache))
-        x = x + self.drop(self.mlp(self.ln2(x)))
+        h = self.ln2(x)
+        if isinstance(self.mlp, MoE):
+            h = self.mlp(h)
+        else:                                                    # column -> GELU -> row
+            up, down = self.mlp[0], self.mlp[2]
+            h = F.gelu(column_parallel(h, up.weight, up.bias, self.tp_group, sp=True))
+            h = row_parallel(h, down.weight, down.bias, self.tp_group, sp=True)
+        x = x + self.drop(h)
         return x
 
 
