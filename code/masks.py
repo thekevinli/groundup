@@ -6,30 +6,58 @@ from torch.nn import functional as F
 # holds when tokens arrive in any order. Shapes: ids (B, S) -> mask (B, S, S).
 
 
-def same_doc(doc_ids):
-    return doc_ids[:, :, None] == doc_ids[:, None, :]                # query i's doc == key j's doc
+def causal_mask(S: int) -> torch.Tensor:
+    # one sequence in order: query i sees keys 0..i
+    return torch.ones(S, S, dtype=torch.bool).tril()
 
 
 def causal_doc_mask(doc_ids, pos_ids):
-    # same document, and key j is not later than query i in that document
-    return same_doc(doc_ids) & (pos_ids[:, None, :] <= pos_ids[:, :, None])
+    # packed documents, tokens in any order: same document, and key j is not later than query i
+    q_doc, k_doc = doc_ids[:, :, None], doc_ids[:, None, :]            # (B, S, 1), (B, 1, S) -> (B, S, S)
+    q_pos, k_pos = pos_ids[:, :, None], pos_ids[:, None, :]
+    same_doc = q_doc == k_doc
+    not_later = k_pos <= q_pos
+    return same_doc & not_later
 
 
 def block_causal_mask(doc_ids, step_ids):
-    # robotics / video: every token of timestep t sees all tokens of steps <= t (ties see each other)
-    return causal_doc_mask(doc_ids, step_ids)
+    # robotics / video: a token of timestep t sees every token of steps <= t, its own step included
+    q_doc, k_doc = doc_ids[:, :, None], doc_ids[:, None, :]
+    q_step, k_step = step_ids[:, :, None], step_ids[:, None, :]
+    same_doc = q_doc == k_doc
+    not_later_step = k_step <= q_step
+    return same_doc & not_later_step
 
 
-def prefix_lm_mask(doc_ids, pos_ids, prefix_len):
-    # bidirectional inside each document's prefix (e.g. an instruction or image), causal after it
-    in_prefix = pos_ids < prefix_len                                    # (B, S); prefix_len per token
-    both_prefix = in_prefix[:, :, None] & in_prefix[:, None, :]
-    return same_doc(doc_ids) & ((pos_ids[:, None, :] <= pos_ids[:, :, None]) | both_prefix)
+def prefix_lm_mask(doc_ids, pos_ids, prefix_len: int):
+    # bidirectional inside the first prefix_len tokens of each document (an instruction), causal after
+    q_doc, k_doc = doc_ids[:, :, None], doc_ids[:, None, :]
+    q_pos, k_pos = pos_ids[:, :, None], pos_ids[:, None, :]
+    same_doc = q_doc == k_doc
+    not_later = k_pos <= q_pos
+    both_in_prefix = (q_pos < prefix_len) & (k_pos < prefix_len)
+    return same_doc & (not_later | both_in_prefix)
 
 
-def sliding_window_mask(doc_ids, pos_ids, window):
-    dist = pos_ids[:, :, None] - pos_ids[:, None, :]                  # how far back key j is
-    return same_doc(doc_ids) & (dist >= 0) & (dist < window)
+def transfusion_mask(doc_ids, pos_ids, img_ids):
+    # interleaved text and images (Transfusion, OmniGen): causal over the sequence, but the patches
+    # of one image see each other. img_ids: which image a token belongs to, -1 for text
+    q_doc, k_doc = doc_ids[:, :, None], doc_ids[:, None, :]
+    q_pos, k_pos = pos_ids[:, :, None], pos_ids[:, None, :]
+    q_img, k_img = img_ids[:, :, None], img_ids[:, None, :]
+    same_doc = q_doc == k_doc
+    not_later = k_pos <= q_pos
+    same_image = (q_img == k_img) & (q_img >= 0)
+    return same_doc & (not_later | same_image)
+
+
+def sliding_window_mask(doc_ids, pos_ids, window: int):
+    # causal, and only the last `window` tokens: memory per query is O(window), not O(S)
+    q_doc, k_doc = doc_ids[:, :, None], doc_ids[:, None, :]
+    q_pos, k_pos = pos_ids[:, :, None], pos_ids[:, None, :]
+    same_doc = q_doc == k_doc
+    dist = q_pos - k_pos                                               # how far back key j is
+    return same_doc & (dist >= 0) & (dist < window)
 
 
 # ---------------- tests ----------------
@@ -80,7 +108,7 @@ def test_permutation_equivariant():
 
 def test_no_empty_rows():
     doc, pos = random_packed()
-    for m in (causal_doc_mask(doc, pos), prefix_lm_mask(doc, pos, torch.full_like(pos, 2)),
+    for m in (causal_doc_mask(doc, pos), prefix_lm_mask(doc, pos, 2),
               sliding_window_mask(doc, pos, 3)):
         assert m.any(dim=-1).all()                                      # every query sees itself: no NaN
 
@@ -101,9 +129,20 @@ def test_variants():
     doc = torch.tensor([[0, 0, 0, 0]]); pos = torch.tensor([[0, 1, 2, 3]])
     step = torch.tensor([[0, 0, 1, 1]])                                 # two tokens per timestep
     assert torch.equal(block_causal_mask(doc, step)[0].int(), torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0], [1, 1, 1, 1], [1, 1, 1, 1]]))
-    assert torch.equal(prefix_lm_mask(doc, pos, torch.full_like(pos, 2))[0].int(), torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]]))
+    assert torch.equal(prefix_lm_mask(doc, pos, 2)[0].int(), torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]]))
     assert torch.equal(sliding_window_mask(doc, pos, 2)[0].int(), torch.tensor([[1, 0, 0, 0], [1, 1, 0, 0], [0, 1, 1, 0], [0, 0, 1, 1]]))
-
+    # interleaved "t i i t i i t": text causal, each image's two patches see each other, never the next image
+    doc7, pos7 = torch.zeros(1, 7, dtype=torch.long), torch.arange(7)[None]
+    img = torch.tensor([[-1, 0, 0, -1, 1, 1, -1]])
+    assert torch.equal(transfusion_mask(doc7, pos7, img)[0].int(), torch.tensor([
+        [1, 0, 0, 0, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1]]))
+    assert torch.equal(causal_doc_mask(doc7, pos7)[0], causal_mask(7))           # one document in order = tril
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

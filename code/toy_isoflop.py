@@ -6,6 +6,7 @@ import urllib.request
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from gpt import GPT
 
@@ -78,14 +79,14 @@ def train(width: int, C: float, lr: float = None, lr_mult: float = 1.0) -> dict:
             i = torch.randint(len(train_data) - BLOCK - 1, (B,))
             x = torch.stack([train_data[j: j + BLOCK] for j in i])
             y = torch.stack([train_data[j + 1: j + BLOCK + 1] for j in i])
-            _, loss = model(x, y)
+            loss = F.cross_entropy(model(x).float().flatten(0, 1), y.flatten())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad(set_to_none=True)
         model.eval()
         with torch.no_grad():
-            vals.append(model(VAL_X, VAL_Y)[1].item())
+            vals.append(F.cross_entropy(model(VAL_X).float().flatten(0, 1), VAL_Y.flatten()).item())
     return dict(C=C, width=width, N=N, D=T, steps=steps, lr=lr, val=float(np.mean(vals)),
                 sem=float(np.std(vals, ddof=1) / np.sqrt(len(vals))))
 

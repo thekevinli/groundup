@@ -6,6 +6,7 @@ import time
 import urllib.request
 
 import torch
+from torch.nn import functional as F
 import torch.distributed as dist
 
 from collectives import all_reduce
@@ -169,10 +170,16 @@ def clip_grad_norm(max_norm: float) -> torch.Tensor:
     return norm
 
 
+def lm_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # next-token cross-entropy in fp32, plus the MoE balance loss (0 for a dense model)
+    logits = model(x)
+    return F.cross_entropy(logits.float().flatten(0, 1), y.flatten()) + 0.01 * model.aux_loss
+
+
 @torch.no_grad()
 def eval_loss(iters: int = 20) -> float:
     model.eval()
-    loss = sum(model(*get_batch("val"))[1] for _ in range(iters)) / iters
+    loss = sum(lm_loss(*get_batch("val")) for _ in range(iters)) / iters
     model.train()
     return (all_reduce(loss) / world if world > 1 else loss).item()
 
@@ -184,7 +191,7 @@ for step in range(max_steps):
         for group in opt.param_groups:
             group["lr"] = group["base_lr"] * lr_scale(step)
     x, y = get_batch("train")
-    _, loss = model(x, y)                                           # bf16 compute, fp32 loss: mean over MY tokens
+    loss = lm_loss(x, y)                                           # bf16 compute, fp32 loss: mean over MY tokens
     loss.backward()                                                 # FSDP averages grads over DP x CP
     if world > 1:
         sync_sp_grads(model, me["tp_group"])                        # SP-marked params saw 1/tp of the tokens

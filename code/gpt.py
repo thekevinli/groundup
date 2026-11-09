@@ -92,6 +92,40 @@ def delta_rule(q, k, v, beta, state=None):
     return torch.stack(out, dim=2), S
 
 
+# Chunkwise: the same outputs, trained like attention. Inside a chunk of C tokens the masked parallel form
+# (matmuls); across chunks only the state. T/C sequential steps instead of T.
+def linear_attention_chunked(q, k, v, state=None, C: int = 64):
+    q, k = F.elu(q) + 1, F.elu(k) + 1
+    B, H, T, d = q.shape
+    S, z = state if state is not None else (q.new_zeros(B, H, d, v.shape[-1]), q.new_zeros(B, H, d))
+    out = []
+    for s in range(0, T, C):
+        qc, kc, vc = q[:, :, s:s + C], k[:, :, s:s + C], v[:, :, s:s + C]
+        A = (qc @ kc.transpose(-2, -1)).tril()                        # this chunk: causal scores, no softmax
+        num = qc @ S + A @ vc                                         # earlier chunks (through S) + this chunk
+        den = (qc * z[:, :, None]).sum(-1, keepdim=True) + A.sum(-1, keepdim=True)
+        out.append(num / den)
+        S = S + kc.transpose(-2, -1) @ vc                             # pass the state to the next chunk
+        z = z + kc.sum(2)
+    return torch.cat(out, dim=2), (S, z)
+
+
+def delta_rule_chunked(q, k, v, beta, state=None, C: int = 64):
+    # in a chunk, write u_i = beta_i (v_i - k_i S_(i-1)) depends on the earlier writes only through k_i k_j:
+    # a triangular system (I + tril(diag(beta) K K^T, -1)) U = diag(beta) (V - K S0), solved with matmuls (WY form)
+    q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+    B, H, T, d = q.shape
+    S = state if state is not None else q.new_zeros(B, H, d, v.shape[-1])
+    out = []
+    for s in range(0, T, C):
+        qc, kc, vc, bc = q[:, :, s:s + C], k[:, :, s:s + C], v[:, :, s:s + C], beta[:, :, s:s + C, None]
+        L = torch.eye(kc.shape[2], device=q.device) + (bc * (kc @ kc.transpose(-2, -1))).tril(-1)
+        U = torch.linalg.solve_triangular(L, bc * (vc - kc @ S), upper=False)   # every write in the chunk
+        out.append(qc @ S + (qc @ kc.transpose(-2, -1)).tril() @ U)  # read: the old state + this chunk's writes
+        S = S + kc.transpose(-2, -1) @ U
+    return torch.cat(out, dim=2), S
+
+
 class MHSA(nn.Module):
 
     def __init__(self, feat_dim: int, num_head: int, num_kv_head: int = None, tp_group=None, cp_group=None,
@@ -129,9 +163,9 @@ class MHSA(nn.Module):
             k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
             state = cache.get("state") if cache is not None else None
             if self.kind == "linear":
-                o, state = linear_attention(q, k, v, state)
+                o, state = linear_attention_chunked(q, k, v, state)
             else:
-                o, state = delta_rule(q, k, v, torch.sigmoid(self.beta(x)).transpose(1, 2), state)
+                o, state = delta_rule_chunked(q, k, v, torch.sigmoid(self.beta(x)).transpose(1, 2), state)
             if cache is not None:
                 cache["state"] = state                                    # its whole cache: a fixed size
             return row_parallel(rearrange(o, "b h s f -> b s (h f)"), self.out.weight, self.out.bias, self.tp_group, sp=True)
@@ -258,7 +292,7 @@ class GPT(nn.Module):
         if isinstance(m, nn.Linear) and m.bias is not None:
             nn.init.zeros_(m.bias)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, seqlist=None, cache=None):
+    def forward(self, idx: torch.Tensor, seqlist=None, cache=None):
         S = idx.shape[1]                                               # my CP chunk (all of it without CP)
         c, cp = (dist.get_rank(self.cp_group), dist.get_world_size(self.cp_group)) if self.cp_group else (0, 1)
         past = max((kv["k"].shape[2] for kv in cache if "k" in kv), default=0) if cache else 0   # tokens cached
@@ -283,13 +317,8 @@ class GPT(nn.Module):
         if self.tp_group:
             x = exit_sp(x, self.tp_group)                                # full sequence for the head
         logits = self.lm_head(self.ln_f(x))                            # (B, S, vocab)
-        loss = None
-        if targets is not None:                                        # -100 = no loss; fp32 loss
-            loss = F.cross_entropy(logits.float().flatten(0, 1), targets.flatten(), ignore_index=-100)
-            aux = [b.mlp.aux_loss for b in self.blocks if isinstance(b.mlp, MoE)]
-            if aux:                                                    # keep the experts load-balanced
-                loss = loss + 0.01 * sum(aux)
-        return logits, loss
+        self.aux_loss = sum(b.mlp.aux_loss for b in self.blocks if isinstance(b.mlp, MoE))   # the trainer adds 0.01 x this
+        return logits
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
@@ -297,7 +326,7 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             if cache is None or idx.shape[1] > self.max_len:           # start, or past the context: prefill
                 cache, new = [{} for _ in self.blocks], idx[:, -self.max_len:]   # one {"k", "v"} per layer
-            logits, _ = self(new, cache=cache)                         # else decode: only the newest token
+            logits = self(new, cache=cache)                         # else decode: only the newest token
             new = logits[:, -1].argmax(dim=-1, keepdim=True)           # greedy
             idx = torch.cat([idx, new], dim=1)
         return idx
@@ -345,7 +374,7 @@ def saved_bytes(model: nn.Module, idx: torch.Tensor, targets: torch.Tensor) -> i
             kept[s.data_ptr()] = s.nbytes()
         return t
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-        _, loss = model(idx, targets)
+        loss = F.cross_entropy(model(idx).float().flatten(0, 1), targets.flatten())
     loss.backward()
     return sum(kept.values())
 
@@ -362,7 +391,7 @@ def _test_ckpt():
         grads = [p.grad.clone() for p in model.parameters()]
         start = time.time()
         for _ in range(3):
-            model(idx, tgt)[1].backward()
+            F.cross_entropy(model(idx).float().flatten(0, 1), tgt.flatten()).backward()
         out[ckpt] = mem, (time.time() - start) / 3, grads
     (mem0, sec0, g0), (mem1, sec1, g1) = out[False], out[True]
     diff = max((a - b).abs().max().item() for a, b in zip(g0, g1))
@@ -434,16 +463,16 @@ def _test(rank: int, world: int, dp: int, cp: int, tp: int):
     torch.manual_seed(0)                                               # same data and weights everywhere
     ref = GPT(**cfg)
     idx, tgt = torch.randint(0, 64, (2 * dp, 16)), torch.randint(0, 64, (2 * dp, 16))
-    ref(idx, tgt)[1].backward()
+    F.cross_entropy(ref(idx).float().flatten(0, 1), tgt.flatten()).backward()
 
     model = GPT(**cfg, tp_group=m["tp_group"], cp_group=m["cp_group"])
     load_tp(model, ref, m["t"], tp)
     model = fully_shard(model, m["fsdp_group"])
     mine = lambda x: x.chunk(dp)[m["d"]].chunk(cp, dim=1)[m["c"]]      # DP: my micro-batch; CP: my chunk
-    _, loss = model(mine(idx), mine(tgt))                              # the training step is unchanged
+    loss = F.cross_entropy(model(mine(idx)).float().flatten(0, 1), mine(tgt).flatten())                              # the training step is unchanged
     loss.backward()
     sync_sp_grads(model, m["tp_group"])
-    assert torch.allclose(all_reduce(loss.detach()) / world, ref(idx, tgt)[1], atol=1e-5)
+    assert torch.allclose(all_reduce(loss.detach()) / world, F.cross_entropy(ref(idx).float().flatten(0, 1), tgt.flatten()), atol=1e-5)
     blk = model.blocks[0]
     g = ref.blocks[0].mlp[0].weight.grad
     for name, want in (("mlp.0.weight", g[m["t"] * len(g) // tp:(m["t"] + 1) * len(g) // tp]),
