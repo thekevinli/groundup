@@ -4,25 +4,27 @@ from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
 
-from collectives import all_gather, all_reduce, all_to_all, init, launch, ring_send_recv
+from collectives import all_gather, all_reduce, all_to_all, init, launch, ring_send_recv, straight_through
 from tp import gather_seq
 
 
 # ---------------- Ulysses: swap sequence-sharding for head-sharding around attention
-class SeqToHeads(torch.autograd.Function):
-    # all-to-all: (B, S/P, H, hd) -> (B, S, H/P, hd). Send head-chunk j of my tokens to rank j;
-    # receive every rank's tokens for my heads. Backward is the inverse all-to-all (collectives.py).
-    @staticmethod
-    def forward(ctx, x, scatter_dim, gather_dim):
-        ctx.dims = scatter_dim, gather_dim
-        P = dist.get_world_size()
-        got = all_to_all(list(x.chunk(P, dim=scatter_dim)), [x.shape[0]] * P)   # dim 0 is B, never split
-        return torch.cat(got, dim=gather_dim)
+def swap(x: torch.Tensor, scatter_dim: int, gather_dim: int) -> torch.Tensor:
+    # all-to-all: cut my tensor into P chunks along scatter_dim, send chunk j to rank j,
+    # concatenate what arrives along gather_dim. swap(swap(x, a, b), b, a) == x
+    P = dist.get_world_size()
+    got = all_to_all(list(x.chunk(P, dim=scatter_dim)), [x.shape[0]] * P)   # dim 0 is B, never split
+    return torch.cat(got, dim=gather_dim)
 
-    @staticmethod
-    def backward(ctx, grad):
-        scatter_dim, gather_dim = ctx.dims
-        return SeqToHeads.apply(grad, gather_dim, scatter_dim), None, None
+
+def seq_to_heads(x: torch.Tensor, scatter_dim: int = 2, gather_dim: int = 1) -> torch.Tensor:
+    # (B, S/P, H, hd) -> (B, S, H/P, hd). a is just x reshaped to the output's shape, so the hook
+    # can hand x its gradient: the inverse swap
+    out = swap(x.detach(), scatter_dim, gather_dim)
+    a = x.reshape(out.shape)
+    if a.requires_grad:
+        a.register_hook(lambda g: swap(g, gather_dim, scatter_dim).reshape(g.shape))
+    return straight_through(out, a)
 
 
 class UlyssesAttention(nn.Module):
@@ -38,9 +40,9 @@ class UlyssesAttention(nn.Module):
         assert self.num_head % dist.get_world_size() == 0       # the limit: P <= heads
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = (rearrange(t, "b s (h f) -> b s h f", h=self.num_head) for t in (q, k, v))
-        q, k, v = (SeqToHeads.apply(t, 2, 1) for t in (q, k, v))   # split heads, gather sequence
+        q, k, v = (seq_to_heads(t) for t in (q, k, v))           # split heads, gather sequence
         o = F.scaled_dot_product_attention(*(t.transpose(1, 2) for t in (q, k, v)), is_causal=True)
-        o = SeqToHeads.apply(o.transpose(1, 2), 1, 2)          # back: split sequence, gather heads
+        o = seq_to_heads(o.transpose(1, 2), 1, 2)               # back: split sequence, gather heads
         return self.out(rearrange(o, "b s h f -> b s (h f)"))   # W_O mixes all heads of a token
 
 

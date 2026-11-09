@@ -4,17 +4,17 @@ from torch import nn
 from torch.func import functional_call
 from torch.utils.checkpoint import checkpoint
 
-from collectives import all_gather, all_reduce, init, launch
+from collectives import all_gather, all_reduce, init, launch, straight_through
 
 
-def gather_param(shard, rows, group):
+def gather_param(shard: torch.Tensor, rows: int, group=None) -> torch.Tensor:
     # forward: all-gather a parameter's dim-0 shards. backward: each rank keeps only its shard's
-    # gradient, averaged over ranks (each saw different data). Same idiom as tp.py: a - a.detach() + b
+    # gradient, averaged over ranks (each saw different data). Same pattern as tp.py
     P, r = dist.get_world_size(group), dist.get_rank(group)
     padded = torch.cat([shard if i == r else torch.zeros_like(shard) for i in range(P)])   # my rows in place
     if padded.requires_grad:
         padded.register_hook(lambda g: all_reduce(g, group) / P)       # backward: average the full gradient
-    full = padded - padded.detach() + all_gather(shard.detach(), group=group)
+    full = straight_through(all_gather(shard.detach(), group=group), padded)
     return full[:rows]                                                  # drop the padding rows
 
 

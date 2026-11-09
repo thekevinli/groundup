@@ -75,6 +75,11 @@ def all_to_all(chunks: list[torch.Tensor], recv_sizes: list[int], group=None) ->
     return out
 
 
+def straight_through(value: torch.Tensor, grad_to: torch.Tensor) -> torch.Tensor:
+    # forward: value (e.g. our collective's result, outside autograd); backward: the gradient goes to grad_to as is
+    return grad_to - grad_to.detach() + value
+
+
 def init(rank: int, world: int, port: int) -> None:
     # the tests' process group: gloo over TCP between the CPU processes launch() spawned, or, with
     # device=cuda under torchrun, NCCL with one GPU per process (torchrun sets rank and world)

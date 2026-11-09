@@ -3,29 +3,28 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from collectives import all_gather, all_reduce, init, launch, reduce_scatter
+from collectives import all_gather, all_reduce, init, launch, reduce_scatter, straight_through
 
 
-# The four SP boundaries along the sequence (dim 1). One idiom throughout:
-#   a - a.detach() + b   ->  forward value b (our collective, no autograd), gradient flows into a
-# and the backward communication is a hook that runs our all_reduce on the gradient.
-def gather_seq(x, group):    # column input; CP's K/V: my S/P tokens -> all S
+# The four SP boundaries along the sequence (dim 1): straight_through gives the forward value from our
+# collective, and the backward communication is a hook that runs our all_reduce on the gradient.
+def gather_seq(x: torch.Tensor, group=None) -> torch.Tensor:    # column input; CP's K/V: my S/P tokens -> all S
     P, r = dist.get_world_size(group), dist.get_rank(group)
     padded = torch.cat([x if i == r else torch.zeros_like(x) for i in range(P)], dim=1)
     if padded.requires_grad:
         padded.register_hook(lambda g: all_reduce(g, group))   # backward: sum every rank's grad for my tokens
-    return padded - padded.detach() + all_gather(x.detach(), 1, group)
+    return straight_through(all_gather(x.detach(), 1, group), padded)
 
 
-def scatter_seq(y, group):   # row output: partial sums over all S -> the full sum for my S/P tokens
+def scatter_seq(y: torch.Tensor, group=None) -> torch.Tensor:   # row output: partial sums over all S -> the full sum for my S/P tokens
     P, r = dist.get_world_size(group), dist.get_rank(group)
     if y.requires_grad:
         y.register_hook(lambda g: all_reduce(g, group))        # backward: my zero-padded grad -> everyone's grads
     mine = y.chunk(P, dim=1)[r]
-    return mine - mine.detach() + reduce_scatter(y.detach(), 1, group)
+    return straight_through(reduce_scatter(y.detach(), 1, group), mine)
 
 
-def enter_sp(x, group):      # after the embedding: keep my S/P tokens
+def enter_sp(x: torch.Tensor, group=None) -> torch.Tensor:      # after the embedding: keep my S/P tokens
     P, r = dist.get_world_size(group), dist.get_rank(group)
     if x.requires_grad:
         x = x.view_as(x)
@@ -33,13 +32,13 @@ def enter_sp(x, group):      # after the embedding: keep my S/P tokens
     return x.chunk(P, dim=1)[r]
 
 
-def exit_sp(x, group):       # before the head: my S/P tokens -> all S (backward: keep my slice of the grad)
+def exit_sp(x: torch.Tensor, group=None) -> torch.Tensor:       # before the head: my S/P tokens -> all S (backward: keep my slice of the grad)
     P, r = dist.get_world_size(group), dist.get_rank(group)
     padded = torch.cat([x if i == r else torch.zeros_like(x) for i in range(P)], dim=1)
-    return padded - padded.detach() + all_gather(x.detach(), 1, group)
+    return straight_through(all_gather(x.detach(), 1, group), padded)
 
 
-def column_parallel(x, w_local, b_local, group, sp=False):
+def column_parallel(x: torch.Tensor, w_local: torch.Tensor, b_local: torch.Tensor, group=None, sp: bool = False) -> torch.Tensor:
     # I own out/P output features. TP: the same full x on every rank. SP: my S/P tokens, gathered here
     if group is None:
         return F.linear(x, w_local, b_local)                   # one GPU
@@ -51,7 +50,7 @@ def column_parallel(x, w_local, b_local, group, sp=False):
     return F.linear(x, w_local, b_local)
 
 
-def row_parallel(x_local, w_local, bias, group, sp=False):
+def row_parallel(x_local: torch.Tensor, w_local: torch.Tensor, bias: torch.Tensor, group=None, sp: bool = False) -> torch.Tensor:
     # x_local = my in/P features (the column layer's output: nothing to slice); outputs are partial sums.
     # TP: all-reduce them. SP: reduce-scatter to my S/P tokens (same bytes, 1/P of the activations)
     y = F.linear(x_local, w_local)
@@ -60,7 +59,7 @@ def row_parallel(x_local, w_local, bias, group, sp=False):
     if sp:
         y = scatter_seq(y, group)
     else:
-        y = y - y.detach() + all_reduce(y.detach(), group)     # forward: the sum; backward: identity
+        y = straight_through(all_reduce(y.detach(), group), y) # forward: the sum; backward: identity
     return y + bias                                            # bias once, after the sum (SP: mark it, see below)
 
 
